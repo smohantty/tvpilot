@@ -17,19 +17,24 @@ tvpilot does **not** orchestrate. It does **not** bundle multi-step flows. It is
 ## Design Principles
 
 1. **Smallest composable unit** — Each subcommand does exactly ONE atomic thing. The agent composes.
-2. **Agent-first** — No interactive prompts, no color, no spinners. Pure function: args in, JSON out.
+2. **Agent-first** — No interactive prompts, no color, no spinners. Structured JSON by default.
 3. **Self-describing** — `schema`, `capabilities`, and `health` let the agent discover what is available and ready at runtime.
-4. **Pipe-native** — stdout is always single-line JSON. Commands can read prior output from stdin via `--stdin`. One invocation = one line.
+4. **Pipe-native** — One-shot commands emit exactly one JSON envelope on stdout. Streaming commands emit one envelope per line. Commands can read prior JSON from stdin via `--stdin`.
 5. **Idempotent where possible** — Repeated calls produce the same result or a no-op.
 6. **Fail loud, fail structured** — Errors are typed JSON with machine-readable codes, retry hints, and suggested next actions.
-7. **Stable IDs** — Apps, UI nodes, content items, and media state use durable references the agent can hold across calls.
-8. **Forward-compatible** — New capabilities appear as new commands. The envelope never changes shape.
+7. **Guarded references** — App IDs and content IDs may be durable; UI node IDs are snapshot-scoped and must be used with the tree revision and expected app context that produced them.
+8. **Capability-gated** — Discovery must expose backend/provider-specific support so the agent only plans with affordances that actually exist on this TV.
+9. **Forward-compatible** — New capabilities appear as new commands or scopes. The envelope never changes shape.
 
 ---
 
 ## I/O Contract
 
-### Output Envelope (stdout, always JSON, one line)
+### Output Envelope (stdout)
+
+Single-shot commands emit exactly one JSON envelope on one line.
+
+Streaming commands emit one JSON envelope per line (NDJSON) using the same top-level keys.
 
 ```jsonc
 {"ok":true,"cmd":"app.launch","rid":"req-42","data":{...},"ts":"2026-03-14T10:23:01Z","ms":12,"v":"0.1.0"}
@@ -55,43 +60,49 @@ Expanded:
 }
 ```
 
+Notes:
+
+- `data` always contains the command-specific payload. For streaming commands like `observe`, each line is its own envelope and `data` carries the event payload.
+- Commands that need shell-friendly scalar output may offer `--raw`, but without `--raw` they still emit the standard envelope.
+
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0    | Success (`ok: true`) |
-| 1    | Command failed (`ok: false`, see `error.code`) |
+| 0    | Command executed successfully (`ok: true`), even if the payload says "not installed", "empty", or similar business state |
+| 1    | Command failed operationally (`ok: false`, see `error.code`) |
 | 2    | Usage error (bad args, unknown subcommand) |
 
 ### Input Conventions
 
 - Positional args for the primary target: `tvpilot app launch org.tizen.netflix`
 - Flags for modifiers: `--limit 5`, `--provider netflix`
-- `--stdin`: read JSON from stdin (for piping previous command output)
+- `--stdin`: read JSON envelope or raw JSON from stdin (for piping previous command output)
 - `--request-id <id>`: caller-generated correlation ID, echoed back in `rid`
 - `--timeout-ms <ms>`: per-command timeout override
 - `--field <path>`: repeated flag to request partial response (reduces token cost)
+- `--raw`: commands that support scalar extraction can emit raw output instead of the standard envelope
 - Long flags only — agents don't need brevity, they need clarity
 
 ### Composability Patterns
 
 ```bash
 # Pipe: extract from previous output
-tvpilot content search "dark knight" --limit 1 | tvpilot pick .data.results[0].deep_link.uri --stdin
+tvpilot content search --query "dark knight" --limit 1 | tvpilot pick .data.results[0].deep_link.uri --stdin --raw
 
 # Chain: sequential with exit-code gating
 tvpilot app launch org.tizen.netflix --uri "netflix://watch/70143836" && tvpilot wait idle && tvpilot volume set 20
 
 # Subshell capture
-tvpilot app launch org.tizen.netflix --uri "$(tvpilot content resolve --title "dark knight" | tvpilot pick .data.launch_uri --stdin)"
+tvpilot app launch org.tizen.netflix --uri "$(tvpilot content resolve --title "dark knight" | tvpilot pick .data.launch_uri --stdin --raw)"
 
 # Parallel
 tvpilot app foreground & tvpilot volume get & tvpilot play status & wait
 
 # Script
-result=$(tvpilot content search "stranger things" --provider netflix --limit 1)
-uri=$(echo "$result" | tvpilot pick .data.results[0].deep_link.uri --stdin)
-app=$(echo "$result" | tvpilot pick .data.results[0].deep_link.app_id --stdin)
+result=$(tvpilot content search --query "stranger things" --provider netflix --limit 1)
+uri=$(echo "$result" | tvpilot pick .data.results[0].deep_link.uri --stdin --raw)
+app=$(echo "$result" | tvpilot pick .data.results[0].deep_link.app_id --stdin --raw)
 tvpilot app launch "$app" --uri "$uri"
 ```
 
@@ -114,6 +125,8 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 | `health` | CLI + platform readiness check | `{ready: bool, checks: [{name, ok, msg}]}` |
 
 `capabilities` tells the agent what's available *before* it tries. Example: does this TV have a tuner? Can it do screen capture? Is accessibility-tree inspection supported?
+
+`capabilities` must expose backend detail, not just booleans. Example: whether observation is `screen_only` vs `ui_tree`, whether playback is `keys_only` vs `provider_observable`, and which content providers have on-device adapters.
 
 `health` is a pre-flight check: are Tizen APIs accessible, is the automation backend up, can we inject keys.
 
@@ -143,7 +156,7 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 | `app launch <app_id> --extra key=val` | Launch with app_control extras (repeatable) | `{app_id, pid, extras: {k:v}}` |
 | `app close <app_id>` | Terminate a running app | `{app_id, was_running}` |
 | `app foreground` | Which app is currently focused | `{app_id, name, pid}` |
-| `app installed <app_id>` | Check if an app is installed (exits 0/1) | `{app_id, installed: bool}` |
+| `app installed <app_id>` | Check if an app is installed (always exits 0 unless the probe itself fails) | `{app_id, installed: bool}` |
 | `app install <path>` | Install .wgt/.tpk from local path | `{app_id, version}` |
 | `app uninstall <app_id>` | Remove an app | `{app_id}` |
 
@@ -159,8 +172,8 @@ Observation-only commands for reading screen and UI state. Separated from mutati
 | `inspect screen` | Capture current screen | `{path, width, height, size_bytes}` |
 | `inspect screen --base64` | Capture as inline base64 | `{width, height, encoding, image}` |
 | `inspect screen --region <x,y,w,h>` | Capture a region | same |
-| `inspect playback` | Current playback state | `{state, content_id, title, position_ms, duration_ms, speed, audio_track, subtitle}` |
-| `inspect ui` | Machine-readable accessibility/UI tree | `{root: {node_id, role, label, ...children}}` |
+| `inspect playback` | Current playback state | `{backend, observed, state, content_id, title, position_ms, duration_ms, speed, audio_track, subtitle}` |
+| `inspect ui` | Machine-readable accessibility/UI tree | `{tree_rev, app_id, captured_at, root: {node_id, role, label, ...children}}` |
 | `inspect ui --depth <n>` | Limit tree depth (default 4) | same |
 | `inspect ui --root <node_id>` | Subtree from a specific node | same |
 | `inspect ui --focused-only` | Only the focused path | same |
@@ -183,24 +196,30 @@ Observation-only commands for reading screen and UI state. Separated from mutati
 }
 ```
 
+Node IDs are only valid within the returned `tree_rev`.
+
+Any command that acts on a node should supply `--tree-rev <rev>` and may additionally guard with `--expect-app <app_id>`. If the UI rerenders or the app changes, the command fails with `STALE_REFERENCE` or `PRECONDITION_FAILED` instead of acting on the wrong target.
+
 This is what enables the agent to reason about screen structure instead of blindly pressing keys.
 
 ---
 
 ### 5. UI
 
-Mutation commands that interact with UI elements by node ID (obtained from `inspect ui`).
+Mutation commands that interact with UI elements by node ID (obtained from `inspect ui`). They should be guarded by snapshot metadata to avoid stale actuation.
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `ui focus <node_id>` | Move focus to a node | `{node_id, focused: true}` |
-| `ui activate <node_id>` | Activate a node (click/select) | `{node_id, action: "activate"}` |
-| `ui activate <node_id> --action <name>` | Specific action: `open`, `play`, `select` | same |
-| `ui input <node_id> --value <text>` | Type text into a specific field node | `{node_id, value}` |
-| `ui input <node_id> --value <text> --submit` | Type and submit | same |
-| `ui text --query <text>` | Find visible nodes by text match | `{matches: [{node_id, role, label, text, bounds}]}` |
+| `ui focus <node_id> --tree-rev <rev>` | Move focus to a node from a specific snapshot | `{node_id, tree_rev, focused: true}` |
+| `ui activate <node_id> --tree-rev <rev>` | Activate a node (click/select) from a specific snapshot | `{node_id, tree_rev, action: "activate"}` |
+| `ui activate <node_id> --tree-rev <rev> --action <name>` | Specific action: `open`, `play`, `select` | same |
+| `ui input <node_id> --tree-rev <rev> --value <text>` | Type text into a specific field node | `{node_id, tree_rev, value}` |
+| `ui input <node_id> --tree-rev <rev> --value <text> --submit` | Type and submit | same |
+| `ui text --query <text>` | Find visible nodes by text match in the current snapshot | `{tree_rev, app_id, matches: [{node_id, role, label, text, bounds}]}` |
 | `ui text --query <text> --exact` | Exact match only | same |
-| `ui path` | Focus/back navigation history | `{path: [{node_id, label, role}]}` |
+| `ui path` | Focus/back navigation history | `{app_id, path: [{node_id, label, role}]}` |
+
+All node-targeting `ui` commands should also accept `--expect-app <app_id>` to fail fast if the foreground app changed since inspection.
 
 ---
 
@@ -227,39 +246,46 @@ Raw key/text injection. Use when UI tree is unavailable or insufficient.
 
 ### 7. Content
 
+These commands are adapter-backed. The agent should only plan against providers and operations advertised by `capabilities.content` and `content providers`.
+
+If a provider lacks a local adapter, it should be absent or marked non-searchable/non-resolvable rather than inviting speculative calls that end in `UNSUPPORTED`.
+
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `content search --query <text>` | Free-text search across providers | `{query, results: [{content_id, title, type, provider, year, rating, synopsis, deep_link: {app_id, uri}, confidence}]}` |
-| `content search --query <text> --provider <id>` | Search one provider | same |
+| `content search --query <text>` | Free-text search across providers with local adapters | `{query, results: [{content_id, title, type, provider, year, rating, synopsis, deep_link: {app_id, uri}, adapter, confidence}]}` |
+| `content search --query <text> --provider <id>` | Search one provider adapter | same |
 | `content search --query <text> --type <movie\|series\|live>` | Filter by type | same |
 | `content search --query <text> --limit <n>` | Cap results (default 10) | same |
 | `content search --query <text> --cursor <cursor>` | Pagination | same + `{cursor}` |
 | `content discover --category <name>` | Browse: `trending`, `recommended`, `continue_watching`, `new` | `{category, items: [{content_id, title, ...}]}` |
 | `content discover --category <name> --provider <id>` | Category within one provider | same |
-| `content resolve --title <title>` | Turn a title into a launchable deep-link | `{content_id, title, provider, launch_uri, app_id, confidence}` |
+| `content resolve --title <title>` | Turn a title into a launchable deep-link | `{content_id, title, provider, app_id, launch_uri, adapter, confidence}` |
+| `content resolve --title <title> --provider <id>` | Resolve a title within one provider | same |
 | `content resolve --content-id <id>` | Resolve by ID | same |
 | `content info <content_id>` | Full metadata | `{content_id, title, type, provider, year, rating, synopsis, seasons, episodes, cast, deep_link}` |
-| `content providers` | List available providers | `{providers: [{id, app_id, installed, searchable, authenticated}]}` |
+| `content providers` | List available providers and adapter capabilities | `{providers: [{id, app_id, installed, searchable, resolvable, launchable, authenticated, adapter}]}` |
 
-`content resolve` is the critical bridge: "I know the title" → "here's the app_id and URI to launch it." It can return a `confidence` score so the agent knows whether to trust or verify.
+`content resolve` is the critical bridge: "I know the title" → "here's the app_id and URI to launch it." It should return `adapter` and `confidence` so the agent knows whether to trust or verify.
 
 ---
 
 ### 8. Playback
 
-Dedicated playback control with structured state. More reliable than key injection for media control.
+Dedicated playback control with structured state when a provider/backend exposes it. More reliable than key injection for media control.
+
+If only media-key injection exists, `capabilities.media` must say so explicitly and the agent should use `nav press` plus `inspect`/vision fallback instead of assuming rich playback telemetry exists.
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `play start --content-id <id>` | Start playing content | `{content_id, state}` |
-| `play start --launch-uri <uri>` | Start via deep-link URI | `{launch_uri, state}` |
+| `play start --content-id <id>` | Start playing content via a supported backend | `{content_id, backend, state}` |
+| `play start --launch-uri <uri>` | Start via deep-link URI | `{launch_uri, backend, state}` |
 | `play start ... --resume` | Resume from last position | same |
-| `play pause` | Pause | `{state: "paused", position_ms}` |
-| `play resume` | Resume | `{state: "playing", position_ms}` |
-| `play stop` | Stop | `{state: "stopped"}` |
-| `play seek --position-ms <ms>` | Seek to absolute position | `{position_ms}` |
-| `play seek --delta-ms <ms>` | Seek relative (positive=forward, negative=back) | `{position_ms, delta_ms}` |
-| `play status` | Current playback state | `{state, content_id, title, position_ms, duration_ms, progress_pct, speed, audio_track, subtitle}` |
+| `play pause` | Pause | `{backend, state: "paused", position_ms}` |
+| `play resume` | Resume | `{backend, state: "playing", position_ms}` |
+| `play stop` | Stop | `{backend, state: "stopped"}` |
+| `play seek --position-ms <ms>` | Seek to absolute position | `{backend, position_ms}` |
+| `play seek --delta-ms <ms>` | Seek relative (positive=forward, negative=back) | `{backend, position_ms, delta_ms}` |
+| `play status` | Current playback state | `{backend, observed, state, content_id, title, position_ms, duration_ms, progress_pct, speed, audio_track, subtitle}` |
 
 ---
 
@@ -271,12 +297,14 @@ Blocking primitives so the agent doesn't write poll loops. Each one blocks until
 |---|---|---|
 | `wait app --app-id <id> --state <state>` | Block until app reaches `foreground`/`background`/`closed`/`ready` | `{app_id, state, waited_ms}` |
 | `wait idle` | Block until screen is stable (no transitions) | `{waited_ms}` |
-| `wait playback --state <state>` | Block until playback reaches `playing`/`paused`/`stopped`/`ended` | `{state, waited_ms}` |
-| `wait node --node <id> --state <state>` | Block until UI node is `visible`/`hidden`/`focused`/`enabled` | `{node_id, state, waited_ms}` |
+| `wait playback --state <state>` | Block until playback reaches `playing`/`paused`/`stopped`/`ended` | `{backend, state, waited_ms}` |
+| `wait node --node <id> --tree-rev <rev> --state <state>` | Block until a node from a specific snapshot is `visible`/`hidden`/`focused`/`enabled` | `{node_id, tree_rev, state, waited_ms}` |
 | `wait text --text <value>` | Block until text appears on screen or in UI tree | `{text, waited_ms}` |
 | `wait text --text <value> --scope <screen\|ui>` | Scope text search | same |
 
 All accept: `--timeout-ms <ms>` (default 10000), `--poll-ms <ms>` (default 250).
+
+Node waits inherit the same stale-reference rules as `ui *`.
 
 ---
 
@@ -357,10 +385,10 @@ All accept: `--timeout-ms <ms>` (default 10000), `--poll-ms <ms>` (default 250).
 
 | Command | Does exactly | Output |
 |---|---|---|
-| `observe --topic <name>` | Stream state changes as NDJSON | One JSON line per event |
-| Topics: `app`, `playback`, `ui`, `state` | Repeatable `--topic` flag | `{topic, event, data, ts}` per line |
+| `observe --topic <name>` | Stream state changes as NDJSON envelopes | One standard JSON envelope per event line |
+| Topics: `app`, `playback`, `ui`, `state` | Repeatable `--topic` flag | `data = {topic, event, payload, seq}` per line |
 
-Long-running. Agent reads stdout line-by-line. More efficient than polling for reactive behavior.
+Long-running. Agent reads stdout line-by-line. More efficient than polling for reactive behavior, and it can reuse the same envelope parser as single-shot commands.
 
 ---
 
@@ -370,14 +398,17 @@ Built-in `jq`-lite for composability on constrained environments.
 
 | Command | Does exactly | Output |
 |---|---|---|
-| `pick <path> --stdin` | Extract a value from stdin JSON | **Raw value** — no envelope |
+| `pick <path> --stdin` | Extract a value from stdin JSON | `{value}` |
+| `pick <path> --stdin --raw` | Extract a value without the envelope | Raw scalar / JSON fragment |
 
 ```bash
-tvpilot content search --query "dark knight" --limit 1 | tvpilot pick .data.results[0].deep_link.uri --stdin
+tvpilot content search --query "dark knight" --limit 1 | tvpilot pick .data.results[0].deep_link.uri --stdin --raw
 # stdout: netflix://watch/70143836
 ```
 
 Path syntax: `.data.results[0].title`, `[*]` for all elements.
+
+Default output stays machine-uniform; `--raw` is a shell convenience.
 
 ---
 
@@ -394,6 +425,8 @@ Path syntax: `.data.results[0].title`, `[*]` for all elements.
 | `PLAYBACK_FAILED` | Playback could not start | yes |
 | `PLAYBACK_INACTIVE` | Playback command but nothing playing | no |
 | `ELEMENT_NOT_FOUND` | UI node ID not found in tree | no |
+| `STALE_REFERENCE` | UI tree revision or node reference is stale | yes |
+| `PRECONDITION_FAILED` | A guard such as `--expect-app` did not match current state | yes |
 | `NAVIGATION_FAILED` | Key injection or focus move failed | yes |
 | `SETTING_NOT_FOUND` | Unknown settings key | no |
 | `SETTING_READ_ONLY` | Cannot write this setting | no |
@@ -403,6 +436,7 @@ Path syntax: `.data.results[0].title`, `[*]` for all elements.
 | `KEY_UNKNOWN` | Unrecognized key name | no |
 | `PERMISSION_DENIED` | Lacks platform privilege | no |
 | `INVALID_ARGS` | Bad arguments or malformed JSON | no |
+| `CAPABILITY_UNAVAILABLE` | Requested provider/backend/capability is not available on this device/runtime | no |
 | `UNSUPPORTED` | Not supported on this device/OS | no |
 | `TIMEOUT` | Operation or wait timed out | yes |
 | `PLATFORM_ERROR` | Tizen API returned unexpected error | yes |
@@ -495,7 +529,7 @@ R = read, W = write, U = utility
 ### "Play Stranger Things on Netflix"
 ```bash
 tvpilot content resolve --title "stranger things" --provider netflix
-# → {content_id, app_id, launch_uri, confidence: 0.95}
+# → {content_id, app_id, launch_uri, adapter, confidence: 0.95}
 
 tvpilot app launch org.tizen.netflix --uri "netflix://watch/80057281" && \
 tvpilot wait idle && \
@@ -504,15 +538,18 @@ tvpilot volume set 30
 
 ### "What's on this screen?" (UI-aware agent)
 ```bash
-tvpilot inspect ui --visible-only --depth 3
-# Agent reads the tree, finds a search box
+tree=$(tvpilot inspect ui --visible-only --depth 3)
+rev=$(echo "$tree" | tvpilot pick .data.tree_rev --stdin --raw)
+app=$(echo "$tree" | tvpilot pick .data.app_id --stdin --raw)
+# Agent reads the tree, finds a search box node n-42
 
-tvpilot ui input n-42 --value "cooking shows" --submit
+tvpilot ui input n-42 --tree-rev "$rev" --expect-app "$app" --value "cooking shows" --submit
 tvpilot wait idle
-tvpilot inspect ui --visible-only
+tree=$(tvpilot inspect ui --visible-only)
+rev=$(echo "$tree" | tvpilot pick .data.tree_rev --stdin --raw)
 # Agent reads results, picks one
 
-tvpilot ui activate n-87
+tvpilot ui activate n-87 --tree-rev "$rev" --expect-app "$app"
 ```
 
 ### "Navigate YouTube blindly" (no UI tree)
@@ -568,13 +605,13 @@ These are not specced yet but the names are reserved to avoid collisions:
 
 ## Open Questions
 
-1. **UI tree availability** — Does the Tizen TV expose an accessibility tree (AT-SPI, EFL accessibility) that `inspect ui` can read? If not, the agent falls back to `inspect screen` + vision + `nav press`. This determines whether the `ui` namespace is feasible in Phase 1 or deferred.
+1. **UI tree availability** — Does the Tizen TV expose an accessibility tree (AT-SPI, EFL accessibility) that `inspect ui` can read? If not, the agent falls back to `inspect screen` + vision + `nav press`. This determines whether the `ui` namespace is feasible in Phase 2 or deferred.
 
-2. **Playback observation** — Can we observe playback state of 3rd-party apps (Netflix, YouTube)? Or can we only inject media keys? Determines whether `play status` and `wait playback` return real data for 3rd-party content.
+2. **Screen capture foundation** — Can we provide `inspect screen` cheaply and reliably enough for Phase 1? If the UI tree is absent or partial, screenshot capture becomes the agent's primary perception path.
 
-3. **Content provider adapters** — How do we discover content from 3rd-party apps on-device? Options: (a) Samsung universal search API, (b) per-provider deep-link catalogs, (c) Tizen content framework. Determines feasibility of `content search/resolve`.
+3. **Playback observation** — Can we observe playback state of 3rd-party apps (Netflix, YouTube)? Or can we only inject media keys? Determines whether `play status` and `wait playback` expose real state or stay capability-gated behind specific adapters.
 
-4. **`jq` availability** — Is `jq` on the TV filesystem? If not, `pick` is critical infrastructure. If yes, it's a convenience.
+4. **Content provider adapters** — How do we discover content from 3rd-party apps on-device? Options: (a) Samsung universal search API, (b) per-provider deep-link catalogs, (c) Tizen content framework. Determines feasibility of `content search/resolve`.
 
 5. **Field filtering scope** — Should `--field` work as a JSON path filter (like GraphQL field selection) or simple top-level key inclusion? Former is more useful, latter is simpler to implement.
 
@@ -583,13 +620,16 @@ These are not specced yet but the names are reserved to avoid collisions:
 ## Phasing
 
 ### Phase 1 — Foundation
-`schema`, `capabilities`, `health`, `system *`, `app *`, `nav *`, `volume *`, `power *`, `wait app`, `wait idle`, `pick`
+`schema`, `capabilities`, `health`, `system *`, `app *`, `inspect screen`, `nav *`, `volume *`, `power *`, `wait app`, `wait idle`, `pick`
 
-### Phase 2 — Observation + UI + Content
-`inspect *`, `ui *`, `content *`, `play *`, `wait node`, `wait text`, `wait playback`, `--field` filtering
+### Phase 2 — Structured Observation + Guarded UI
+`inspect app`, `inspect ui`, snapshot guards (`tree_rev`, `--expect-app`), `ui *`, `wait node`, `wait text`, `--field` filtering
 
-### Phase 3 — TV Control
+### Phase 3 — Adapter-Backed Media + Content
+`inspect playback`, `content *`, `play *`, `wait playback`, provider/backend capability maps
+
+### Phase 4 — TV Control
 `source *`, `channel *`, `epg *`, `setting *`, `notify *`, `app install/uninstall`
 
-### Phase 4 — Efficiency + Learning
-`observe`, `session *`, `recipe *`, confidence tagging, streaming NDJSON
+### Phase 5 — Efficiency + Learning
+`observe`, `session *`, `recipe *`, confidence tagging, streaming NDJSON envelopes
