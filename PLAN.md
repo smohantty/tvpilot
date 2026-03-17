@@ -24,7 +24,8 @@ tvpilot does **not** orchestrate. It does **not** bundle multi-step flows. It is
 6. **Fail loud, fail structured** — Errors are typed JSON with machine-readable codes, retry hints, and suggested next actions.
 7. **Guarded references** — App IDs and content IDs may be durable; UI node IDs are snapshot-scoped and must be used with the tree revision and expected app context that produced them.
 8. **Capability-gated** — Discovery must expose backend/provider-specific support so the agent only plans with affordances that actually exist on this TV.
-9. **Forward-compatible** — New capabilities appear as new commands or scopes. The envelope never changes shape.
+9. **Minimal lookup per command** — A targeted command resolves only the target it needs. It must not trigger hidden global discovery such as a full app inventory unless the command explicitly asks for it.
+10. **Forward-compatible** — New capabilities appear as new commands or scopes. The envelope never changes shape.
 
 ---
 
@@ -88,22 +89,22 @@ Notes:
 ### Composability Patterns
 
 ```bash
-# Pipe: extract from previous output
-tvpilot content search --query "dark knight" --limit 1 | tvpilot pick .data.results[0].deep_link.uri --stdin --raw
+# Pipe: search and launch directly from a result's launch object
+tvpilot content search --query "dark knight" --limit 1 | tvpilot app launch --stdin --path .data.results[0].launch
 
 # Chain: sequential with exit-code gating
 tvpilot app launch netflix --uri "netflix://watch/70143836" && tvpilot wait idle && tvpilot volume set 20
 
 # Subshell capture
-tvpilot app launch netflix --uri "$(tvpilot content resolve --title "dark knight" | tvpilot pick .data.launch_uri --stdin --raw)"
+tvpilot app launch netflix --uri "$(tvpilot content resolve --title "dark knight" | tvpilot pick .data.launch.uri --stdin --raw)"
 
 # Parallel
 tvpilot app foreground & tvpilot volume get & tvpilot play status & wait
 
 # Script
 result=$(tvpilot content search --query "stranger things" --provider netflix --limit 1)
-uri=$(echo "$result" | tvpilot pick .data.results[0].deep_link.uri --stdin --raw)
-app=$(echo "$result" | tvpilot pick .data.results[0].deep_link.handle --stdin --raw)
+uri=$(echo "$result" | tvpilot pick .data.results[0].launch.uri --stdin --raw)
+app=$(echo "$result" | tvpilot pick .data.results[0].launch.app --stdin --raw)
 tvpilot app launch "$app" --uri "$uri"
 ```
 
@@ -126,6 +127,50 @@ Rules:
 
 ---
 
+## Execution Model
+
+`tvpilot` should be a thin command surface over a small set of internal authorities. It should not behave like a hidden inventory scanner on every invocation.
+
+### Responsibility Split
+
+- **CLI process (`tvpilot`)** — parses args, enforces the output/error contract, performs minimal per-command orchestration, resolves `handle`/`app_id` references, and issues targeted reads/writes to the appropriate backend.
+- **Platform authority** — the source of truth for live runtime facts such as installed apps, running apps, foreground app, launchability, playback hooks, source switching, volume, and key injection. This may be a native Tizen API or a local system service wrapping those APIs.
+- **Optional local daemon/service** — owns long-lived subscriptions, `wait *`, `observe`, expensive discovery reuse, and warm caches that benefit repeated CLI invocations. The CLI may query it when present but must not require it for every basic command.
+- **Persistent store / DB** — holds durable metadata such as canonical-handle registries, local overrides, learned mappings, and last-known snapshots. It is not the primary authority for volatile runtime state.
+
+### Source-of-Truth Rules
+
+- If a fact can change outside `tvpilot` and must be correct now, it should come from the platform authority or a daemon that mirrors platform events.
+- Persistent storage may accelerate resolution, but live runtime state always wins when cache and runtime disagree.
+- Undocumented platform DBs may be used only as a fallback or enrichment path, not as the primary contract for live app/runtime state.
+
+### Lookup Policy
+
+- **Explicit global discovery commands** may enumerate broadly: `app list`, `app list --running`, `capabilities`, `health`, and provider discovery commands.
+- **Targeted commands** must do only targeted work: `app launch`, `app close`, `app installed`, `app info`, `wait app`, and similar commands must not implicitly call `app list` first.
+- A targeted app command should resolve `<app_ref>` using the cheapest path that can be correct: direct `app_id`, explicit local override, bundled handle registry, daemon-resolved mapping, then targeted validation against the platform authority.
+- If targeted validation finds no match, return `APP_NOT_FOUND`. If it finds more than one plausible match, return `AMBIGUOUS_APP_REF` with candidates rather than guessing.
+
+### Cache Policy
+
+- Safe to cache: `handle`, `display_name`, candidate `app_id`s, app type, version, adapter metadata, provider metadata, and learned overrides.
+- Do not treat as cache-authoritative: installed-now, running-now, foreground-now, pid, readiness, playback-now, current UI tree, and other volatile state.
+- The daemon may keep warm caches for performance, but command semantics still reflect live reality, not stale snapshots.
+
+### Handle Resolution
+
+For a command like `tvpilot app launch netflix`, the expected path is:
+
+1. Resolve `netflix` through an override map or bundled handle registry to one or more candidate `app_id`s.
+2. Validate the candidate(s) against the platform authority with targeted checks instead of enumerating the full app list.
+3. If exactly one candidate is valid, use it and return the resolved `{handle, display_name, app_id}` in the response.
+4. If no candidate is valid, return `APP_NOT_FOUND`.
+5. If multiple candidates are valid, return `AMBIGUOUS_APP_REF` with candidate identities.
+
+This keeps frequent LLM-composed invocations cheap while preserving exact execution.
+
+---
+
 ## Command Reference
 
 Naming: `<noun> <verb>` — the noun is the domain, the verb is the single action.
@@ -144,9 +189,9 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 
 `capabilities` tells the agent what's available *before* it tries. Example: does this TV have a tuner? Can it do screen capture? Is accessibility-tree inspection supported?
 
-`capabilities` must expose backend detail, not just booleans. Example: whether observation is `screen_only` vs `ui_tree`, whether playback is `keys_only` vs `provider_observable`, which content providers have on-device adapters, and which canonical handles resolve to which installed `app_id`.
+`capabilities` must expose backend detail, not just booleans. Example: whether observation is `screen_only` vs `ui_tree`, whether playback is `keys_only` vs `provider_observable`, which content providers have on-device adapters, which canonical handles resolve to which installed `app_id`, and whether an optional helper daemon/resolver service is available.
 
-`health` is a pre-flight check: are Tizen APIs accessible, is the automation backend up, can we inject keys.
+`health` is a pre-flight check: are Tizen APIs accessible, is the automation backend up, can we inject keys, and if a helper daemon exists is it reachable and in sync.
 
 ---
 
@@ -172,6 +217,8 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 | `app launch <app_ref>` | Launch/foreground an app | `{handle, display_name, app_id, pid}` |
 | `app launch <app_ref> --uri <deeplink>` | Launch with deep-link | `{handle, display_name, app_id, pid, uri}` |
 | `app launch <app_ref> --extra key=val` | Launch with app_control extras (repeatable) | `{handle, display_name, app_id, pid, extras: {k:v}}` |
+| `app launch --stdin` | Launch from a raw launch object read from stdin | `{handle, display_name, app_id, pid, uri, backend}` |
+| `app launch --stdin --path <path>` | Launch from a launch object nested inside stdin JSON | same |
 | `app close <app_ref>` | Terminate a running app | `{handle, display_name, app_id, was_running}` |
 | `app foreground` | Which app is currently focused | `{handle, display_name, app_id, pid}` |
 | `app installed <app_ref>` | Check if an app is installed (always exits 0 unless the probe itself fails) | `{handle, display_name, app_id, installed: bool}` |
@@ -179,6 +226,10 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 | `app uninstall <app_ref>` | Remove an app | `{handle, display_name, app_id}` |
 
 Where an app command takes `<app_ref>`, it accepts either the canonical `handle` or the exact `app_id`. The CLI should resolve the reference internally and return the fully resolved identity in the response.
+
+`app launch --stdin` consumes a normalized launch object shaped like `{app, display_name, app_id, uri, extras, backend}`. The `app` field is the canonical handle accepted by `app launch <app_ref>`. When stdin contains a larger envelope, `--path` extracts the nested launch object to consume.
+
+`app list` is an explicit discovery command. Commands like `app launch`, `app close`, `app installed`, and `wait app` must not implicitly enumerate the full app list first.
 
 ---
 
@@ -272,20 +323,35 @@ If a provider lacks a local adapter, it should be absent or marked non-searchabl
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `content search --query <text>` | Free-text search across providers with local adapters | `{query, results: [{content_id, title, type, provider, provider_display_name, year, rating, synopsis, deep_link: {handle, display_name, app_id, uri}, adapter, confidence}]}` |
+| `content search --query <text>` | Free-text search across providers with local adapters | `{query, results: [{content_id, title, type, provider, provider_display_name, year, rating, synopsis, launchable, auth_required, launch: {app, display_name, app_id, uri, extras, backend}, adapter, confidence}]}` |
 | `content search --query <text> --provider <handle>` | Search one provider adapter | same |
 | `content search --query <text> --type <movie\|series\|live>` | Filter by type | same |
 | `content search --query <text> --limit <n>` | Cap results (default 10) | same |
 | `content search --query <text> --cursor <cursor>` | Pagination | same + `{cursor}` |
 | `content discover --category <name>` | Browse: `trending`, `recommended`, `continue_watching`, `new` | `{category, items: [{content_id, title, ...}]}` |
 | `content discover --category <name> --provider <handle>` | Category within one provider | same |
-| `content resolve --title <title>` | Turn a title into a launchable deep-link | `{content_id, title, provider, provider_display_name, handle, display_name, app_id, launch_uri, adapter, confidence}` |
+| `content resolve --title <title>` | Turn a title into a launch-ready result | `{content_id, title, provider, provider_display_name, launchable, auth_required, launch: {app, display_name, app_id, uri, extras, backend}, adapter, confidence}` |
 | `content resolve --title <title> --provider <handle>` | Resolve a title within one provider | same |
 | `content resolve --content-id <id>` | Resolve by ID | same |
-| `content info <content_id>` | Full metadata | `{content_id, title, type, provider, provider_display_name, year, rating, synopsis, seasons, episodes, cast, deep_link}` |
+| `content info <content_id>` | Full metadata | `{content_id, title, type, provider, provider_display_name, year, rating, synopsis, seasons, episodes, cast, launch}` |
 | `content providers` | List available providers and adapter capabilities | `{providers: [{handle, display_name, app_id, installed, searchable, resolvable, launchable, authenticated, adapter}]}` |
 
-`content resolve` is the critical bridge: "I know the title" → "here's the app handle/app_id and URI to launch it." It should return the canonical `handle`, exact `app_id`, `adapter`, and `confidence` so the agent knows what to execute and whether to trust or verify.
+`content search` should return launch-ready results whenever the provider adapter can produce them. Each result includes a normalized `launch` object that `app launch` can consume directly.
+
+Normalized launch object shape:
+
+```jsonc
+{
+  "app": "netflix",            // canonical app handle accepted by `app launch`
+  "display_name": "Netflix",
+  "app_id": "org.netflix",
+  "uri": "netflix://watch/80057281",
+  "extras": {},
+  "backend": "deeplink"
+}
+```
+
+`content resolve` is the critical bridge: "I know the title" → "here is the best launch object for it." It should return `launchable`, the normalized `launch` object, `adapter`, and `confidence` so the agent knows what to execute and whether to trust or verify.
 
 ---
 
@@ -410,6 +476,8 @@ Node waits inherit the same stale-reference rules as `ui *`.
 
 Long-running. Agent reads stdout line-by-line. More efficient than polling for reactive behavior, and it can reuse the same envelope parser as single-shot commands.
 
+An optional daemon/service is the natural implementation point for `observe`, but the CLI contract stays the same whether events are sourced directly or proxied through that daemon.
+
 ---
 
 ### 18. Pick (utility)
@@ -422,7 +490,7 @@ Built-in `jq`-lite for composability on constrained environments.
 | `pick <path> --stdin --raw` | Extract a value without the envelope | Raw scalar / JSON fragment |
 
 ```bash
-tvpilot content search --query "dark knight" --limit 1 | tvpilot pick .data.results[0].deep_link.uri --stdin --raw
+tvpilot content search --query "dark knight" --limit 1 | tvpilot pick .data.results[0].launch.uri --stdin --raw
 # stdout: netflix://watch/70143836
 ```
 
@@ -437,6 +505,7 @@ Default output stays machine-uniform; `--raw` is a shell convenience.
 | Code | When | Retryable |
 |------|------|-----------|
 | `APP_NOT_FOUND` | App handle or app ID doesn't match any installed app | no |
+| `AMBIGUOUS_APP_REF` | A handle or partial app reference resolves to multiple plausible installed apps | no |
 | `APP_LAUNCH_FAILED` | App failed to launch | yes |
 | `APP_NOT_RUNNING` | Tried to close an app that isn't running | no |
 | `CONTENT_NOT_FOUND` | Content ID invalid or unavailable | no |
@@ -548,10 +617,8 @@ R = read, W = write, U = utility
 
 ### "Play Stranger Things on Netflix"
 ```bash
-tvpilot content resolve --title "stranger things" --provider netflix
-# → {content_id, handle: "netflix", app_id, launch_uri, adapter, confidence: 0.95}
-
-tvpilot app launch netflix --uri "netflix://watch/80057281" && \
+tvpilot content resolve --title "stranger things" --provider netflix | \
+tvpilot app launch --stdin --path .data.launch && \
 tvpilot wait idle && \
 tvpilot volume set 30
 ```
