@@ -75,13 +75,14 @@ Notes:
 
 ### Input Conventions
 
-- Positional args for the primary target: `tvpilot app launch org.tizen.netflix`
+- Positional args for the primary target: `tvpilot app launch netflix`
 - Flags for modifiers: `--limit 5`, `--provider netflix`
 - `--stdin`: read JSON envelope or raw JSON from stdin (for piping previous command output)
 - `--request-id <id>`: caller-generated correlation ID, echoed back in `rid`
 - `--timeout-ms <ms>`: per-command timeout override
 - `--field <path>`: repeated flag to request partial response (reduces token cost)
 - `--raw`: commands that support scalar extraction can emit raw output instead of the standard envelope
+- For app/provider targets, prefer canonical handles like `netflix`, `youtube`, `tv_plus`; exact `app_id` is still accepted as an escape hatch
 - Long flags only — agents don't need brevity, they need clarity
 
 ### Composability Patterns
@@ -91,10 +92,10 @@ Notes:
 tvpilot content search --query "dark knight" --limit 1 | tvpilot pick .data.results[0].deep_link.uri --stdin --raw
 
 # Chain: sequential with exit-code gating
-tvpilot app launch org.tizen.netflix --uri "netflix://watch/70143836" && tvpilot wait idle && tvpilot volume set 20
+tvpilot app launch netflix --uri "netflix://watch/70143836" && tvpilot wait idle && tvpilot volume set 20
 
 # Subshell capture
-tvpilot app launch org.tizen.netflix --uri "$(tvpilot content resolve --title "dark knight" | tvpilot pick .data.launch_uri --stdin --raw)"
+tvpilot app launch netflix --uri "$(tvpilot content resolve --title "dark knight" | tvpilot pick .data.launch_uri --stdin --raw)"
 
 # Parallel
 tvpilot app foreground & tvpilot volume get & tvpilot play status & wait
@@ -102,9 +103,26 @@ tvpilot app foreground & tvpilot volume get & tvpilot play status & wait
 # Script
 result=$(tvpilot content search --query "stranger things" --provider netflix --limit 1)
 uri=$(echo "$result" | tvpilot pick .data.results[0].deep_link.uri --stdin --raw)
-app=$(echo "$result" | tvpilot pick .data.results[0].deep_link.app_id --stdin --raw)
+app=$(echo "$result" | tvpilot pick .data.results[0].deep_link.handle --stdin --raw)
 tvpilot app launch "$app" --uri "$uri"
 ```
+
+---
+
+## Identity Model
+
+Every app/provider exposed to the agent has up to three identifiers:
+
+- `handle` — the canonical, CLI-facing stable slug chosen by `tvpilot`, such as `netflix`, `youtube`, or `tv_plus`. This is what the agent should plan with and pass to commands by default.
+- `display_name` — the human-facing name shown in UI and logs, such as `Netflix`, `YouTube`, or `Samsung TV Plus`. This may be localized or vary slightly by firmware.
+- `app_id` — the exact platform-native identifier used by Tizen launch/install/runtime APIs, such as `org.tizen.tvplus` or a provider-specific package ID. This is precise but not a good primary planning token for an LLM.
+
+Rules:
+
+- App-targeting commands should accept `<app_ref>`, where `<app_ref>` may be either a `handle` or an exact `app_id`.
+- The agent should prefer `handle`; `app_id` remains available for debugging, exact low-level control, and integration with native launchers.
+- Responses should return `handle`, `display_name`, and `app_id` whenever known so the agent can reason semantically while still keeping an exact execution target.
+- In content commands, the `provider` field uses the same canonical handle space as app `handle`.
 
 ---
 
@@ -126,7 +144,7 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 
 `capabilities` tells the agent what's available *before* it tries. Example: does this TV have a tuner? Can it do screen capture? Is accessibility-tree inspection supported?
 
-`capabilities` must expose backend detail, not just booleans. Example: whether observation is `screen_only` vs `ui_tree`, whether playback is `keys_only` vs `provider_observable`, and which content providers have on-device adapters.
+`capabilities` must expose backend detail, not just booleans. Example: whether observation is `screen_only` vs `ui_tree`, whether playback is `keys_only` vs `provider_observable`, which content providers have on-device adapters, and which canonical handles resolve to which installed `app_id`.
 
 `health` is a pre-flight check: are Tizen APIs accessible, is the automation backend up, can we inject keys.
 
@@ -148,17 +166,19 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `app list` | All installed apps | `{apps: [{app_id, name, version, type}]}` |
-| `app list --running` | Only running apps | `{apps: [{app_id, name, pid, state}]}` |
-| `app info <app_id>` | One app's metadata | `{app_id, name, version, type, state, installed_size_kb}` |
-| `app launch <app_id>` | Launch/foreground an app | `{app_id, pid}` |
-| `app launch <app_id> --uri <deeplink>` | Launch with deep-link | `{app_id, pid, uri}` |
-| `app launch <app_id> --extra key=val` | Launch with app_control extras (repeatable) | `{app_id, pid, extras: {k:v}}` |
-| `app close <app_id>` | Terminate a running app | `{app_id, was_running}` |
-| `app foreground` | Which app is currently focused | `{app_id, name, pid}` |
-| `app installed <app_id>` | Check if an app is installed (always exits 0 unless the probe itself fails) | `{app_id, installed: bool}` |
-| `app install <path>` | Install .wgt/.tpk from local path | `{app_id, version}` |
-| `app uninstall <app_id>` | Remove an app | `{app_id}` |
+| `app list` | All installed apps | `{apps: [{handle, display_name, app_id, version, type}]}` |
+| `app list --running` | Only running apps | `{apps: [{handle, display_name, app_id, pid, state}]}` |
+| `app info <app_ref>` | One app's metadata and resolved identity | `{handle, display_name, app_id, version, type, state, installed_size_kb}` |
+| `app launch <app_ref>` | Launch/foreground an app | `{handle, display_name, app_id, pid}` |
+| `app launch <app_ref> --uri <deeplink>` | Launch with deep-link | `{handle, display_name, app_id, pid, uri}` |
+| `app launch <app_ref> --extra key=val` | Launch with app_control extras (repeatable) | `{handle, display_name, app_id, pid, extras: {k:v}}` |
+| `app close <app_ref>` | Terminate a running app | `{handle, display_name, app_id, was_running}` |
+| `app foreground` | Which app is currently focused | `{handle, display_name, app_id, pid}` |
+| `app installed <app_ref>` | Check if an app is installed (always exits 0 unless the probe itself fails) | `{handle, display_name, app_id, installed: bool}` |
+| `app install <path>` | Install .wgt/.tpk from local path | `{handle, display_name, app_id, version}` |
+| `app uninstall <app_ref>` | Remove an app | `{handle, display_name, app_id}` |
+
+Where an app command takes `<app_ref>`, it accepts either the canonical `handle` or the exact `app_id`. The CLI should resolve the reference internally and return the fully resolved identity in the response.
 
 ---
 
@@ -168,12 +188,12 @@ Observation-only commands for reading screen and UI state. Separated from mutati
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `inspect app` | Current foreground app | `{app_id, name, pid}` |
+| `inspect app` | Current foreground app | `{handle, display_name, app_id, pid}` |
 | `inspect screen` | Capture current screen | `{path, width, height, size_bytes}` |
 | `inspect screen --base64` | Capture as inline base64 | `{width, height, encoding, image}` |
 | `inspect screen --region <x,y,w,h>` | Capture a region | same |
 | `inspect playback` | Current playback state | `{backend, observed, state, content_id, title, position_ms, duration_ms, speed, audio_track, subtitle}` |
-| `inspect ui` | Machine-readable accessibility/UI tree | `{tree_rev, app_id, captured_at, root: {node_id, role, label, ...children}}` |
+| `inspect ui` | Machine-readable accessibility/UI tree | `{tree_rev, app_handle, app_display_name, app_id, captured_at, root: {node_id, role, label, ...children}}` |
 | `inspect ui --depth <n>` | Limit tree depth (default 4) | same |
 | `inspect ui --root <node_id>` | Subtree from a specific node | same |
 | `inspect ui --focused-only` | Only the focused path | same |
@@ -198,7 +218,7 @@ Observation-only commands for reading screen and UI state. Separated from mutati
 
 Node IDs are only valid within the returned `tree_rev`.
 
-Any command that acts on a node should supply `--tree-rev <rev>` and may additionally guard with `--expect-app <app_id>`. If the UI rerenders or the app changes, the command fails with `STALE_REFERENCE` or `PRECONDITION_FAILED` instead of acting on the wrong target.
+Any command that acts on a node should supply `--tree-rev <rev>` and may additionally guard with `--expect-app <app_ref>`. If the UI rerenders or the app changes, the command fails with `STALE_REFERENCE` or `PRECONDITION_FAILED` instead of acting on the wrong target.
 
 This is what enables the agent to reason about screen structure instead of blindly pressing keys.
 
@@ -215,11 +235,11 @@ Mutation commands that interact with UI elements by node ID (obtained from `insp
 | `ui activate <node_id> --tree-rev <rev> --action <name>` | Specific action: `open`, `play`, `select` | same |
 | `ui input <node_id> --tree-rev <rev> --value <text>` | Type text into a specific field node | `{node_id, tree_rev, value}` |
 | `ui input <node_id> --tree-rev <rev> --value <text> --submit` | Type and submit | same |
-| `ui text --query <text>` | Find visible nodes by text match in the current snapshot | `{tree_rev, app_id, matches: [{node_id, role, label, text, bounds}]}` |
+| `ui text --query <text>` | Find visible nodes by text match in the current snapshot | `{tree_rev, app_handle, app_display_name, app_id, matches: [{node_id, role, label, text, bounds}]}` |
 | `ui text --query <text> --exact` | Exact match only | same |
-| `ui path` | Focus/back navigation history | `{app_id, path: [{node_id, label, role}]}` |
+| `ui path` | Focus/back navigation history | `{app_handle, app_display_name, app_id, path: [{node_id, label, role}]}` |
 
-All node-targeting `ui` commands should also accept `--expect-app <app_id>` to fail fast if the foreground app changed since inspection.
+All node-targeting `ui` commands should also accept `--expect-app <app_ref>` to fail fast if the foreground app changed since inspection.
 
 ---
 
@@ -252,20 +272,20 @@ If a provider lacks a local adapter, it should be absent or marked non-searchabl
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `content search --query <text>` | Free-text search across providers with local adapters | `{query, results: [{content_id, title, type, provider, year, rating, synopsis, deep_link: {app_id, uri}, adapter, confidence}]}` |
-| `content search --query <text> --provider <id>` | Search one provider adapter | same |
+| `content search --query <text>` | Free-text search across providers with local adapters | `{query, results: [{content_id, title, type, provider, provider_display_name, year, rating, synopsis, deep_link: {handle, display_name, app_id, uri}, adapter, confidence}]}` |
+| `content search --query <text> --provider <handle>` | Search one provider adapter | same |
 | `content search --query <text> --type <movie\|series\|live>` | Filter by type | same |
 | `content search --query <text> --limit <n>` | Cap results (default 10) | same |
 | `content search --query <text> --cursor <cursor>` | Pagination | same + `{cursor}` |
 | `content discover --category <name>` | Browse: `trending`, `recommended`, `continue_watching`, `new` | `{category, items: [{content_id, title, ...}]}` |
-| `content discover --category <name> --provider <id>` | Category within one provider | same |
-| `content resolve --title <title>` | Turn a title into a launchable deep-link | `{content_id, title, provider, app_id, launch_uri, adapter, confidence}` |
-| `content resolve --title <title> --provider <id>` | Resolve a title within one provider | same |
+| `content discover --category <name> --provider <handle>` | Category within one provider | same |
+| `content resolve --title <title>` | Turn a title into a launchable deep-link | `{content_id, title, provider, provider_display_name, handle, display_name, app_id, launch_uri, adapter, confidence}` |
+| `content resolve --title <title> --provider <handle>` | Resolve a title within one provider | same |
 | `content resolve --content-id <id>` | Resolve by ID | same |
-| `content info <content_id>` | Full metadata | `{content_id, title, type, provider, year, rating, synopsis, seasons, episodes, cast, deep_link}` |
-| `content providers` | List available providers and adapter capabilities | `{providers: [{id, app_id, installed, searchable, resolvable, launchable, authenticated, adapter}]}` |
+| `content info <content_id>` | Full metadata | `{content_id, title, type, provider, provider_display_name, year, rating, synopsis, seasons, episodes, cast, deep_link}` |
+| `content providers` | List available providers and adapter capabilities | `{providers: [{handle, display_name, app_id, installed, searchable, resolvable, launchable, authenticated, adapter}]}` |
 
-`content resolve` is the critical bridge: "I know the title" → "here's the app_id and URI to launch it." It should return `adapter` and `confidence` so the agent knows whether to trust or verify.
+`content resolve` is the critical bridge: "I know the title" → "here's the app handle/app_id and URI to launch it." It should return the canonical `handle`, exact `app_id`, `adapter`, and `confidence` so the agent knows what to execute and whether to trust or verify.
 
 ---
 
@@ -295,7 +315,7 @@ Blocking primitives so the agent doesn't write poll loops. Each one blocks until
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `wait app --app-id <id> --state <state>` | Block until app reaches `foreground`/`background`/`closed`/`ready` | `{app_id, state, waited_ms}` |
+| `wait app --app <app_ref> --state <state>` | Block until app reaches `foreground`/`background`/`closed`/`ready` | `{handle, display_name, app_id, state, waited_ms}` |
 | `wait idle` | Block until screen is stable (no transitions) | `{waited_ms}` |
 | `wait playback --state <state>` | Block until playback reaches `playing`/`paused`/`stopped`/`ended` | `{backend, state, waited_ms}` |
 | `wait node --node <id> --tree-rev <rev> --state <state>` | Block until a node from a specific snapshot is `visible`/`hidden`/`focused`/`enabled` | `{node_id, tree_rev, state, waited_ms}` |
@@ -416,7 +436,7 @@ Default output stays machine-uniform; `--raw` is a shell convenience.
 
 | Code | When | Retryable |
 |------|------|-----------|
-| `APP_NOT_FOUND` | App ID doesn't match any installed app | no |
+| `APP_NOT_FOUND` | App handle or app ID doesn't match any installed app | no |
 | `APP_LAUNCH_FAILED` | App failed to launch | yes |
 | `APP_NOT_RUNNING` | Tried to close an app that isn't running | no |
 | `CONTENT_NOT_FOUND` | Content ID invalid or unavailable | no |
@@ -460,13 +480,13 @@ Each error includes: `code`, `msg`, `retryable`, `hint` (suggested next command)
 | 7 | `system uptime` | system | R |
 | 8 | `system network` | system | R |
 | 9 | `app list` | app | R |
-| 10 | `app info <id>` | app | R |
-| 11 | `app launch <id>` | app | W |
-| 12 | `app close <id>` | app | W |
+| 10 | `app info <app_ref>` | app | R |
+| 11 | `app launch <app_ref>` | app | W |
+| 12 | `app close <app_ref>` | app | W |
 | 13 | `app foreground` | app | R |
-| 14 | `app installed <id>` | app | R |
+| 14 | `app installed <app_ref>` | app | R |
 | 15 | `app install <path>` | app | W |
-| 16 | `app uninstall <id>` | app | W |
+| 16 | `app uninstall <app_ref>` | app | W |
 | 17 | `inspect app` | inspect | R |
 | 18 | `inspect screen` | inspect | R |
 | 19 | `inspect playback` | inspect | R |
@@ -529,9 +549,9 @@ R = read, W = write, U = utility
 ### "Play Stranger Things on Netflix"
 ```bash
 tvpilot content resolve --title "stranger things" --provider netflix
-# → {content_id, app_id, launch_uri, adapter, confidence: 0.95}
+# → {content_id, handle: "netflix", app_id, launch_uri, adapter, confidence: 0.95}
 
-tvpilot app launch org.tizen.netflix --uri "netflix://watch/80057281" && \
+tvpilot app launch netflix --uri "netflix://watch/80057281" && \
 tvpilot wait idle && \
 tvpilot volume set 30
 ```
@@ -540,7 +560,7 @@ tvpilot volume set 30
 ```bash
 tree=$(tvpilot inspect ui --visible-only --depth 3)
 rev=$(echo "$tree" | tvpilot pick .data.tree_rev --stdin --raw)
-app=$(echo "$tree" | tvpilot pick .data.app_id --stdin --raw)
+app=$(echo "$tree" | tvpilot pick .data.app_handle --stdin --raw)
 # Agent reads the tree, finds a search box node n-42
 
 tvpilot ui input n-42 --tree-rev "$rev" --expect-app "$app" --value "cooking shows" --submit
@@ -554,8 +574,8 @@ tvpilot ui activate n-87 --tree-rev "$rev" --expect-app "$app"
 
 ### "Navigate YouTube blindly" (no UI tree)
 ```bash
-tvpilot app launch org.tizen.youtube && \
-tvpilot wait app --app-id org.tizen.youtube --state foreground && \
+tvpilot app launch youtube && \
+tvpilot wait app --app youtube --state foreground && \
 tvpilot nav press UP UP LEFT ENTER && \
 tvpilot nav text --value "cooking videos" --submit
 ```
