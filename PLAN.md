@@ -189,7 +189,7 @@ Naming: `<noun> <verb>` — the noun is the domain, the verb is the single actio
 
 `capabilities` tells the agent what's available *before* it tries. Example: does this TV have a tuner? Can it do screen capture? Is accessibility-tree inspection supported?
 
-`capabilities` must expose backend detail, not just booleans. Example: whether observation is `screen_only` vs `ui_tree`, whether playback is `keys_only` vs `provider_observable`, which content providers have on-device adapters, which canonical handles resolve to which installed `app_id`, and whether an optional helper daemon/resolver service is available.
+`capabilities` must expose backend detail, not just booleans. Example: whether observation is `screen_only` vs `ui_tree`, whether playback is `keys_only` vs `provider_observable`, which content sources and providers have on-device adapters, which canonical handles resolve to which installed `app_id`, what the default content-search scope is, and whether an optional helper daemon/resolver service is available.
 
 `health` is a pre-flight check: are Tizen APIs accessible, is the automation backend up, can we inject keys, and if a helper daemon exists is it reachable and in sync.
 
@@ -317,26 +317,37 @@ Raw key/text injection. Use when UI tree is unavailable or insufficient.
 
 ### 7. Content
 
-These commands are adapter-backed. The agent should only plan against providers and operations advertised by `capabilities.content` and `content providers`.
+These commands are adapter-backed and federated. The agent should only plan against content sources, providers, and operations advertised by `capabilities.content`, `content sources`, and `content providers`.
 
-If a provider lacks a local adapter, it should be absent or marked non-searchable/non-resolvable rather than inviting speculative calls that end in `UNSUPPORTED`.
+Important distinction:
+
+- `source` = where `tvpilot` executes the search, for example `searchon`, `youtube`, or `netflix`
+- `provider` = where the content is actually playable/launched, for example `netflix`, `disney`, or `youtube`
+
+An aggregator source like `searchon` may return results whose provider is `netflix` or `disney`.
+
+If a source or provider lacks a usable local adapter, it should be absent or marked unavailable rather than inviting speculative calls that end in `UNSUPPORTED`.
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `content search --query <text>` | Free-text search across providers with local adapters | `{query, results: [{content_id, title, type, provider, provider_display_name, year, rating, synopsis, launchable, auth_required, launch: {app, display_name, app_id, uri, extras, backend}, adapter, confidence}]}` |
-| `content search --query <text> --provider <handle>` | Search one provider adapter | same |
+| `content search --query <text>` | Free-text federated search across the default source scope (`installed_searchable`) | `{query, scope, sources, results: [{content_id, dedupe_key, title, type, source, source_display_name, provider, provider_display_name, year, rating, synopsis, launchable, auth_required, launch: {app, display_name, app_id, uri, extras, backend}, adapter, confidence}]}` |
+| `content search --query <text> --source <id>` | Search one source (repeatable) | same |
+| `content search --query <text> --provider <handle>` | Restrict results to one provider (repeatable) | same |
+| `content search --query <text> --scope <name>` | Search scope: `installed_searchable`, `all_available`, `provider_native_only`, `aggregators_only` | same |
 | `content search --query <text> --type <movie\|series\|live>` | Filter by type | same |
 | `content search --query <text> --limit <n>` | Cap results (default 10) | same |
 | `content search --query <text> --cursor <cursor>` | Pagination | same + `{cursor}` |
 | `content discover --category <name>` | Browse: `trending`, `recommended`, `continue_watching`, `new` | `{category, items: [{content_id, title, ...}]}` |
 | `content discover --category <name> --provider <handle>` | Category within one provider | same |
-| `content resolve --title <title>` | Turn a title into a launch-ready result | `{content_id, title, provider, provider_display_name, launchable, auth_required, launch: {app, display_name, app_id, uri, extras, backend}, adapter, confidence}` |
+| `content resolve --title <title>` | Turn a title into the best launch-ready result from the current search space | `{content_id, dedupe_key, title, source, source_display_name, provider, provider_display_name, launchable, auth_required, launch: {app, display_name, app_id, uri, extras, backend}, adapter, confidence}` |
 | `content resolve --title <title> --provider <handle>` | Resolve a title within one provider | same |
+| `content resolve --title <title> --source <id>` | Resolve using one source | same |
 | `content resolve --content-id <id>` | Resolve by ID | same |
 | `content info <content_id>` | Full metadata | `{content_id, title, type, provider, provider_display_name, year, rating, synopsis, seasons, episodes, cast, launch}` |
 | `content providers` | List available providers and adapter capabilities | `{providers: [{handle, display_name, app_id, installed, searchable, resolvable, launchable, authenticated, adapter}]}` |
+| `content sources` | List available search sources and their coverage | `{sources: [{id, display_name, kind, available, providers, adapter}]}` |
 
-`content search` should return launch-ready results whenever the provider adapter can produce them. Each result includes a normalized `launch` object that `app launch` can consume directly.
+`content search` should return launch-ready results whenever any queried source can produce them. Each result includes provenance (`source`, `provider`, `adapter`) and a normalized `launch` object that `app launch` can consume directly.
 
 Normalized launch object shape:
 
@@ -351,7 +362,16 @@ Normalized launch object shape:
 }
 ```
 
-`content resolve` is the critical bridge: "I know the title" → "here is the best launch object for it." It should return `launchable`, the normalized `launch` object, `adapter`, and `confidence` so the agent knows what to execute and whether to trust or verify.
+Federated search pipeline:
+
+1. Select sources from `--source`, `--scope`, or the default scope.
+2. Query each available source adapter.
+3. Normalize results into one schema.
+4. Dedupe cross-source matches using `dedupe_key` when available.
+5. Rank results by title match, launchability, install/auth status, provider preference, source trust, and confidence.
+6. Return the merged result set.
+
+`content resolve` is the critical bridge: "I know the title" → "here is the best launch object for it from the current search space." It should return `launchable`, `source`, `provider`, the normalized `launch` object, `adapter`, and `confidence` so the agent knows what to execute and whether to trust or verify.
 
 ---
 
@@ -509,6 +529,7 @@ Default output stays machine-uniform; `--raw` is a shell convenience.
 | `APP_LAUNCH_FAILED` | App failed to launch | yes |
 | `APP_NOT_RUNNING` | Tried to close an app that isn't running | no |
 | `CONTENT_NOT_FOUND` | Content ID invalid or unavailable | no |
+| `SEARCH_SOURCE_UNAVAILABLE` | Requested search source is unavailable or not queryable | no |
 | `PROVIDER_UNAVAILABLE` | Provider app not installed | no |
 | `AUTH_REQUIRED` | Provider app not logged in | no |
 | `PLAYBACK_FAILED` | Playback could not start | yes |
@@ -575,39 +596,40 @@ Each error includes: `code`, `msg`, `retryable`, `hint` (suggested next command)
 | 33 | `content resolve` | content | R |
 | 34 | `content info <id>` | content | R |
 | 35 | `content providers` | content | R |
-| 36 | `play start` | playback | W |
-| 37 | `play pause` | playback | W |
-| 38 | `play resume` | playback | W |
-| 39 | `play stop` | playback | W |
-| 40 | `play seek` | playback | W |
-| 41 | `play status` | playback | R |
-| 42 | `wait app` | wait | U |
-| 43 | `wait idle` | wait | U |
-| 44 | `wait playback` | wait | U |
-| 45 | `wait node` | wait | U |
-| 46 | `wait text` | wait | U |
-| 47 | `volume get` | volume | R |
-| 48 | `volume set <n>` | volume | W |
-| 49 | `volume mute` | volume | W |
-| 50 | `volume unmute` | volume | W |
-| 51 | `source list` | source | R |
-| 52 | `source get` | source | R |
-| 53 | `source set <id>` | source | W |
-| 54 | `channel list` | channel | R |
-| 55 | `channel get` | channel | R |
-| 56 | `channel set <id>` | channel | W |
-| 57 | `epg now` | epg | R |
-| 58 | `epg schedule` | epg | R |
-| 59 | `setting get <key>` | setting | R |
-| 60 | `setting set <key> <val>` | setting | W |
-| 61 | `setting list` | setting | R |
-| 62 | `power status` | power | R |
-| 63 | `power standby` | power | W |
-| 64 | `power reboot` | power | W |
-| 65 | `notify show` | notify | W |
-| 66 | `notify dismiss` | notify | W |
-| 67 | `observe` | stream | R |
-| 68 | `pick <path> --stdin` | utility | U |
+| 36 | `content sources` | content | R |
+| 37 | `play start` | playback | W |
+| 38 | `play pause` | playback | W |
+| 39 | `play resume` | playback | W |
+| 40 | `play stop` | playback | W |
+| 41 | `play seek` | playback | W |
+| 42 | `play status` | playback | R |
+| 43 | `wait app` | wait | U |
+| 44 | `wait idle` | wait | U |
+| 45 | `wait playback` | wait | U |
+| 46 | `wait node` | wait | U |
+| 47 | `wait text` | wait | U |
+| 48 | `volume get` | volume | R |
+| 49 | `volume set <n>` | volume | W |
+| 50 | `volume mute` | volume | W |
+| 51 | `volume unmute` | volume | W |
+| 52 | `source list` | source | R |
+| 53 | `source get` | source | R |
+| 54 | `source set <id>` | source | W |
+| 55 | `channel list` | channel | R |
+| 56 | `channel get` | channel | R |
+| 57 | `channel set <id>` | channel | W |
+| 58 | `epg now` | epg | R |
+| 59 | `epg schedule` | epg | R |
+| 60 | `setting get <key>` | setting | R |
+| 61 | `setting set <key> <val>` | setting | W |
+| 62 | `setting list` | setting | R |
+| 63 | `power status` | power | R |
+| 64 | `power standby` | power | W |
+| 65 | `power reboot` | power | W |
+| 66 | `notify show` | notify | W |
+| 67 | `notify dismiss` | notify | W |
+| 68 | `observe` | stream | R |
+| 69 | `pick <path> --stdin` | utility | U |
 
 R = read, W = write, U = utility
 
@@ -621,6 +643,12 @@ tvpilot content resolve --title "stranger things" --provider netflix | \
 tvpilot app launch --stdin --path .data.launch && \
 tvpilot wait idle && \
 tvpilot volume set 30
+```
+
+### "Search across all available sources"
+```bash
+tvpilot content search --query "stranger things" --scope installed_searchable --limit 5
+# Results may come from source=searchon while provider=netflix
 ```
 
 ### "What's on this screen?" (UI-aware agent)
@@ -698,7 +726,7 @@ These are not specced yet but the names are reserved to avoid collisions:
 
 3. **Playback observation** — Can we observe playback state of 3rd-party apps (Netflix, YouTube)? Or can we only inject media keys? Determines whether `play status` and `wait playback` expose real state or stay capability-gated behind specific adapters.
 
-4. **Content provider adapters** — How do we discover content from 3rd-party apps on-device? Options: (a) Samsung universal search API, (b) per-provider deep-link catalogs, (c) Tizen content framework. Determines feasibility of `content search/resolve`.
+4. **Content source adapters and federation** — How do we query aggregator sources like SearchOn versus provider-native sources like YouTube or Netflix on-device? How do we rank and dedupe cross-source results? Determines feasibility of federated `content search/resolve`.
 
 5. **Field filtering scope** — Should `--field` work as a JSON path filter (like GraphQL field selection) or simple top-level key inclusion? Former is more useful, latter is simpler to implement.
 
@@ -713,7 +741,7 @@ These are not specced yet but the names are reserved to avoid collisions:
 `inspect app`, `inspect ui`, snapshot guards (`tree_rev`, `--expect-app`), `ui *`, `wait node`, `wait text`, `--field` filtering
 
 ### Phase 3 — Adapter-Backed Media + Content
-`inspect playback`, `content *`, `play *`, `wait playback`, provider/backend capability maps
+`inspect playback`, `content *`, `play *`, `wait playback`, source/provider/backend capability maps
 
 ### Phase 4 — TV Control
 `source *`, `channel *`, `epg *`, `setting *`, `notify *`, `app install/uninstall`
