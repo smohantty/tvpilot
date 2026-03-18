@@ -2,11 +2,11 @@
 
 Current public chain:
 
-- `search sources`
+- `search catalogs`
 - `content search`
 - `play`
 
-This phase is intentionally only about search-tool discovery, content search, and launch handoff.
+This phase is intentionally only about catalog discovery, content search, and launch handoff.
 
 ---
 
@@ -14,19 +14,18 @@ This phase is intentionally only about search-tool discovery, content search, an
 
 `tvpilot` should expose only the minimum surfaces needed for an agent to:
 
-1. discover which search tools exist
-2. filter those tools by catalog and explicit source choice
+1. discover which catalogs are searchable
+2. optionally constrain search to one catalog
 3. search content
 4. hand a launch object into playback
 
 Design rules:
 
-1. A `source` is a search tool.
-2. A `catalog` is the content namespace a source can search.
-3. `search sources` returns the source spec the agent plans from.
-4. `content search` accepts `query`, optional `sources[]`, and optional `catalog`.
-5. If `sources[]` is omitted, `content search` queries all matching available sources.
-6. `play` accepts a `LaunchSpec` directly or from stdin.
+1. `search catalogs` returns only a list of searchable catalogs.
+2. `content search` accepts `query` and optional `catalog`.
+3. Internal search-tool selection is hidden behind `content search`.
+4. If `catalog` is omitted, `content search` searches all searchable catalogs through the available internal tools.
+5. `play` accepts a `LaunchSpec` directly or from stdin.
 
 ---
 
@@ -58,10 +57,10 @@ Error form:
   "rid": "req-42",
   "data": null,
   "error": {
-    "code": "NO_MATCHING_SOURCE",
-    "msg": "No available source can satisfy the requested filters",
+    "code": "CATALOG_UNSEARCHABLE",
+    "msg": "No internal search tool can search catalog 'watcha'",
     "retryable": false,
-    "hint": "search sources"
+    "hint": "search catalogs"
   },
   "ts": "2026-03-18T08:21:00Z",
   "ms": 5,
@@ -80,8 +79,7 @@ Error form:
 ### Input Conventions
 
 - Use `--query <text>` for the free-text search string.
-- Use `--source <id>` as a repeatable filter when the caller wants specific search tools.
-- Use `--catalog <handle>` to keep only sources that can search that catalog.
+- Use `--catalog <handle>` to constrain search to one catalog.
 - Use `--stdin` when a command should consume JSON from a prior command.
 - Use `--path <json_path>` to extract a nested object from stdin before command execution.
 - Use `--launch-spec <json>` when the caller wants to pass a launch object directly.
@@ -90,26 +88,9 @@ Error form:
 
 ## Domain Model
 
-### Source
-
-A `source` is the search tool the CLI can query.
-
-Examples:
-
-- `searchon`
-- `youtube_direct`
-- `watcha_direct`
-
-What the agent needs to know about a source:
-
-- its id
-- its display name
-- whether it is available
-- which catalogs it can search
-
 ### Catalog
 
-A `catalog` is the logical content namespace being searched.
+A `catalog` is the public planning token.
 
 Examples:
 
@@ -118,24 +99,18 @@ Examples:
 - `watcha`
 - `tv_plus`
 
-This is just a filter for source selection and result labeling.
+The agent uses catalogs to decide whether to search broadly or constrain the query.
 
-### Source Spec
+### Internal Source Selection
 
-`search sources` should return:
+Internal search tools may exist, but they are not part of the public chain.
 
-- `id`
-- `display_name`
-- `available`
-- `catalogs`
+Rules:
 
-That is enough for chaining.
-
-Example interpretation:
-
-- if a source lists `catalogs: ["youtube", "netflix"]`, the agent may use it for either catalog
-- if a source lists only `["watcha"]`, the agent must not use it for `netflix`
-- if two sources both list `youtube`, the agent may query both when the request needs YouTube results
+- `search catalogs` exposes only what is searchable now
+- `content search` chooses the needed internal search tools automatically
+- if `catalog` is given, `content search` uses only tools that can search that catalog
+- if `catalog` is omitted, `content search` searches across all searchable catalogs and aggregates results
 
 ### LaunchSpec
 
@@ -158,33 +133,36 @@ This object is execution-only. Search owns title and catalog metadata; `play` on
 
 ## Command Reference
 
-### 1. Search Sources
+### 1. Search Catalogs
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `search sources` | List search tools and the catalogs each tool can search | `{sources: [{id, display_name, available, catalogs}]}` |
+| `search catalogs` | List currently searchable catalogs | `{catalogs: [<handle>, ...]}` |
+
+Example:
+
+```jsonc
+{
+  "catalogs": ["netflix", "tv_plus", "watcha", "youtube"]
+}
+```
 
 ### 2. Content Search
 
 | Command | Does exactly | Output `data` |
 |---|---|---|
-| `content search --query <text>` | Search all matching available sources | `{query, sources, catalog, results, cursor}` |
-| `content search --query <text> --source <id>` | Search one explicit source | same |
-| `content search --query <text> --source <id> --source <id>` | Search an explicit source list | same |
-| `content search --query <text> --catalog <handle>` | Search only sources that can search that catalog | same |
-| `content search --query <text> --catalog <handle> --source <id>...` | Search the intersection of source filter and catalog filter | same |
+| `content search --query <text>` | Search across everything currently searchable | `{query, catalog, results, cursor}` |
+| `content search --query <text> --catalog <handle>` | Search one catalog | same |
 | `content search --query <text> --limit <n>` | Cap result count | same |
 | `content search --query <text> --cursor <cursor>` | Fetch the next page | same plus `cursor` |
 
 Search behavior:
 
 1. `query` is required.
-2. If `sources[]` is present, use exactly that source set.
-3. Otherwise, start from all available sources.
-4. If `catalog` is present, keep only sources whose `catalogs` include it.
-5. Query the remaining sources.
-6. Aggregate results and dedupe overlaps.
-7. If no source remains after filtering, return `NO_MATCHING_SOURCE`.
+2. If `catalog` is omitted, search everything currently searchable.
+3. If `catalog` is present, search only that catalog.
+4. Internal search-tool selection and aggregation are handled by `tvpilot`.
+5. If the requested catalog is not searchable, return `CATALOG_UNSEARCHABLE`.
 
 ### 3. Play
 
@@ -200,20 +178,19 @@ Search behavior:
 
 The intended chain is:
 
-1. Inspect sources with `search sources`.
-2. Decide whether the query needs all sources or a filtered source set.
-3. Run `content search`.
-4. Pipe the selected result's `launch` object into `play`.
+1. Inspect searchable catalogs with `search catalogs`.
+2. Run `content search` with or without `--catalog`.
+3. Pipe the selected result's `launch` object into `play`.
 
 Examples:
 
-### Inspect tools
+### List searchable catalogs
 
 ```bash
-tvpilot search sources
+tvpilot search catalogs
 ```
 
-### Search all tools
+### Search across everything searchable
 
 ```bash
 tvpilot content search --query "top gun"
@@ -225,49 +202,24 @@ tvpilot content search --query "top gun"
 tvpilot content search --query "top gun" --catalog netflix
 ```
 
-### Search one source
+### Search YouTube then play
 
 ```bash
-tvpilot content search --query "top gun" --source searchon
+tvpilot content search --query "lofi hip hop" --catalog youtube --limit 1 | \
+tvpilot play --stdin --path .data.results[0].launch
 ```
 
-### Search multiple explicit sources
-
-```bash
-tvpilot content search \
-  --query "lofi hip hop" \
-  --source searchon \
-  --source youtube_direct
-```
-
-### Search one catalog across multiple sources
-
-```bash
-tvpilot content search \
-  --query "lofi hip hop" \
-  --catalog youtube \
-  --source searchon \
-  --source youtube_direct
-```
-
-### Search then play
+### Search Netflix then play
 
 ```bash
 tvpilot content search --query "top gun" --catalog netflix --limit 1 | \
 tvpilot play --stdin --path .data.results[0].launch
 ```
 
-### Search all tools then play
+### Search everything then play
 
 ```bash
 tvpilot content search --query "top gun" --limit 1 | \
-tvpilot play --stdin --path .data.results[0].launch
-```
-
-### Search one source then play
-
-```bash
-tvpilot content search --query "top gun" --source searchon --limit 1 | \
 tvpilot play --stdin --path .data.results[0].launch
 ```
 
@@ -283,8 +235,7 @@ tvpilot play --launch-spec '{"app_handle":"youtube","app_display_name":"YouTube"
 
 | Code | When | Retryable |
 |---|---|---|
-| `SEARCH_SOURCE_UNAVAILABLE` | A requested source is unavailable or not queryable | no |
-| `NO_MATCHING_SOURCE` | No available source matches the requested filters | no |
+| `CATALOG_UNSEARCHABLE` | The requested catalog is not currently searchable | no |
 | `CONTENT_NOT_FOUND` | No content matched the request | no |
 | `AUTH_REQUIRED` | The result is known but playback requires authentication | no |
 | `INVALID_LAUNCH_SPEC` | `play` did not receive a valid `LaunchSpec` | no |
@@ -296,6 +247,7 @@ tvpilot play --launch-spec '{"app_handle":"youtube","app_display_name":"YouTube"
 
 Not part of this phase:
 
+- public source/tool selection
 - app inventory or app launch commands outside `play`
 - playback status or control families beyond `play`
 - UI tree inspection or UI interaction

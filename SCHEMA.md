@@ -2,16 +2,17 @@
 
 This file defines the current public chain:
 
-- `search sources`
+- `search catalogs`
 - `content search`
 - `play`
 
 In this phase:
 
-- a `source` is a search tool
 - a `catalog` is a logical content namespace like `youtube`, `netflix`, or `watcha`
-- `content search` filters sources by `sources[]`, `catalog`, and `query`
-- if no source filter is provided, `content search` queries all matching available sources, aggregates the results, and dedupes them
+- `search catalogs` returns the currently searchable catalogs
+- `content search` accepts `query` and optional `catalog`
+- if no catalog is provided, `content search` searches all internal search tools, aggregates results, and dedupes overlaps
+- internal source/tool selection is not part of the public contract
 
 ---
 
@@ -41,10 +42,10 @@ Error form:
   "rid": "req-42",
   "data": null,
   "error": {
-    "code": "NO_MATCHING_SOURCE",
-    "msg": "No available source can satisfy the requested filters",
+    "code": "CATALOG_UNSEARCHABLE",
+    "msg": "No internal search tool can search catalog 'watcha'",
     "retryable": false,
-    "hint": "search sources"
+    "hint": "search catalogs"
   },
   "ts": "2026-03-18T08:21:00Z",
   "ms": 7,
@@ -55,30 +56,6 @@ Error form:
 ---
 
 ## Shared Types
-
-### SearchSource
-
-Describes one search tool the agent can choose.
-
-```jsonc
-{
-  "id": "searchon",
-  "display_name": "Samsung Search",
-  "available": true,
-  "catalogs": ["tv_plus", "youtube", "watcha", "netflix"]
-}
-```
-
-Field meanings:
-
-- `id`: canonical source id used by `content search --source`
-- `display_name`: human-facing source label
-- `available`: whether the source can currently be queried
-- `catalogs`: logical catalogs this source can search
-
-Selection rule:
-
-- If a source does not list a catalog, the agent must not use that source to search that catalog.
 
 ### LaunchSpec
 
@@ -112,8 +89,6 @@ Field meanings:
   "dedupe_key": "imdb:tt0092099",
   "title": "Top Gun",
   "type": "movie",
-  "source": "searchon",
-  "source_display_name": "Samsung Search",
   "catalog": "netflix",
   "catalog_display_name": "Netflix",
   "year": 1986,
@@ -135,17 +110,9 @@ Field meanings:
 
 Field meanings:
 
-- `source`: which search tool produced the result
-- `catalog`: which logical catalog the result belongs to
+- `catalog`: the logical catalog the result belongs to
 - `launch`: the `LaunchSpec` that `play` can consume directly
 - `confidence`: normalized match confidence
-
-Important distinction:
-
-- `source` is the queried tool
-- `catalog` is the content namespace in the result
-- one source may return many catalogs
-- the same catalog may appear from multiple sources
 
 ### PlayResult
 
@@ -172,42 +139,23 @@ Field meanings:
 
 ## Command Schemas
 
-### 1. `search sources`
+### 1. `search catalogs`
 
 CLI:
 
 ```bash
-tvpilot search sources
+tvpilot search catalogs
 ```
 
 `data` shape:
 
 ```jsonc
 {
-  "sources": [
-    {
-      "id": "searchon",
-      "display_name": "Samsung Search",
-      "available": true,
-      "catalogs": ["tv_plus", "youtube", "watcha", "netflix"]
-    },
-    {
-      "id": "youtube_direct",
-      "display_name": "YouTube",
-      "available": true,
-      "catalogs": ["youtube"]
-    },
-    {
-      "id": "watcha_direct",
-      "display_name": "Watcha",
-      "available": false,
-      "catalogs": ["watcha"]
-    }
-  ]
+  "catalogs": ["netflix", "tv_plus", "watcha", "youtube"]
 }
 ```
 
-This output is the only source-planning spec the agent needs.
+This list should contain only catalogs that are currently searchable.
 
 ### 2. `content search`
 
@@ -216,8 +164,7 @@ CLI:
 ```bash
 tvpilot content search --query "top gun"
 tvpilot content search --query "top gun" --catalog netflix
-tvpilot content search --query "top gun" --source searchon
-tvpilot content search --query "lofi hip hop" --catalog youtube --source searchon --source youtube_direct
+tvpilot content search --query "lofi hip hop" --catalog youtube
 ```
 
 Conceptual input:
@@ -227,7 +174,6 @@ Conceptual input:
   "cmd": "content.search",
   "args": {
     "query": "top gun",
-    "sources": ["searchon"],
     "catalog": "netflix",
     "limit": 5,
     "cursor": null
@@ -240,7 +186,6 @@ Conceptual input:
 ```jsonc
 {
   "query": "top gun",
-  "sources": ["searchon"],
   "catalog": "netflix",
   "results": [
     {
@@ -248,8 +193,6 @@ Conceptual input:
       "dedupe_key": "imdb:tt0092099",
       "title": "Top Gun",
       "type": "movie",
-      "source": "searchon",
-      "source_display_name": "Samsung Search",
       "catalog": "netflix",
       "catalog_display_name": "Netflix",
       "year": 1986,
@@ -275,18 +218,11 @@ Conceptual input:
 Search semantics:
 
 - `query` is required
-- `source` is repeatable and pins the exact source list when provided
-- `catalog` filters sources and results by catalog
-- if `source` is omitted, the CLI starts from all available sources
-- if `catalog` is provided, the CLI keeps only sources whose `catalogs` include that catalog
-- the CLI queries the remaining sources, aggregates results, and dedupes overlaps
-- if no source remains after filtering, return `NO_MATCHING_SOURCE`
-
-Selection examples:
-
-- `--catalog netflix` means use only sources that advertise `netflix`
-- `--source watcha_direct --catalog netflix` should fail with `NO_MATCHING_SOURCE`
-- no `--source` and no `--catalog` means search all available sources
+- `catalog` is optional
+- if `catalog` is omitted, the CLI searches all internally available search tools, aggregates results, and dedupes overlaps
+- if `catalog` is provided, the CLI uses only internal search tools that can search that catalog
+- if no internal search tool can search the requested catalog, return `CATALOG_UNSEARCHABLE`
+- `launch` is the execution handoff object for `play`
 
 ### 3. `play`
 
@@ -328,80 +264,51 @@ Execution notes:
 
 - `play` accepts either `--launch-spec <json>` or `--stdin`
 - when stdin contains a larger envelope, `--path` extracts the nested `LaunchSpec`
-- `play` only needs `LaunchSpec`; it does not need title metadata
+- `play` only needs `LaunchSpec`
 
 ---
 
 ## Chaining Examples
 
-### 1. Inspect Search Tools
+### 1. List Searchable Catalogs
 
 ```bash
-tvpilot search sources
+tvpilot search catalogs
 ```
 
-### 2. Search Every Available Source
+### 2. Search Across Everything Searchable
 
 ```bash
 tvpilot content search --query "top gun"
 ```
 
-### 3. Search Every Netflix-Capable Source
+### 3. Search One Catalog
 
 ```bash
 tvpilot content search --query "top gun" --catalog netflix
 ```
 
-### 4. Search One Explicit Source
+### 4. Search YouTube Catalog
 
 ```bash
-tvpilot content search --query "top gun" --source searchon
+tvpilot content search --query "lofi hip hop" --catalog youtube
 ```
 
-### 5. Search Two Explicit Sources For One Catalog
-
-```bash
-tvpilot content search \
-  --query "lofi hip hop" \
-  --catalog youtube \
-  --source searchon \
-  --source youtube_direct
-```
-
-### 6. Search Then Play First Result
+### 5. Search Then Play First Result
 
 ```bash
 tvpilot content search --query "top gun" --catalog netflix --limit 1 | \
 tvpilot play --stdin --path .data.results[0].launch
 ```
 
-### 7. Search All Sources Then Play First Result
+### 6. Search Across Everything Then Play
 
 ```bash
 tvpilot content search --query "top gun" --limit 1 | \
 tvpilot play --stdin --path .data.results[0].launch
 ```
 
-### 8. Search One Source Then Play
-
-```bash
-tvpilot content search --query "top gun" --source searchon --limit 1 | \
-tvpilot play --stdin --path .data.results[0].launch
-```
-
-### 9. Search One Catalog Across Multiple Sources Then Play
-
-```bash
-tvpilot content search \
-  --query "lofi hip hop" \
-  --catalog youtube \
-  --source searchon \
-  --source youtube_direct \
-  --limit 1 | \
-tvpilot play --stdin --path .data.results[0].launch
-```
-
-### 10. Play From An Inline LaunchSpec
+### 7. Play From An Inline LaunchSpec
 
 ```bash
 tvpilot play --launch-spec '{"app_handle":"youtube","app_display_name":"YouTube","app_id":"org.youtube","launch_uri":"youtube://watch?v=abc123","launch_extras":{},"launch_method":"deeplink"}'
