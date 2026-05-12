@@ -18,6 +18,21 @@ pub enum Command {
         interactive: bool,
         verbose: bool,
     },
+    /// Inject a TV remote key via libcapi-ui-efl-util. `name` is a friendly
+    /// verb ("down", "enter", "back", "volup", …) — the daemon maps it to the
+    /// Tizen efl_util key string.
+    Key {
+        name: String,
+        count: u32,
+    },
+    /// Click an element by its `eN` ref from the most recent snapshot.
+    /// Runs the click ladder (PLAN.md): try direct action → highlight+Enter
+    /// → focus+Enter. Returns a fresh snapshot.
+    Click {
+        ref_id: String,
+        interactive: bool,
+        verbose: bool,
+    },
     Close,
 }
 
@@ -32,6 +47,7 @@ pub struct Response {
 pub enum Payload {
     Pong { uptime_ms: u64 },
     Snap(SnapResult),
+    KeySent { count: u32 },
     Closed,
     Error(String),
 }

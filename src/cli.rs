@@ -30,7 +30,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
     let mut iter = args.iter();
     let verb = iter
         .next()
-        .ok_or_else(|| anyhow::anyhow!("usage: tvpilot <snap|ping|close> [...]"))?;
+        .ok_or_else(|| anyhow::anyhow!("usage: tvpilot <snap|click|key|ping|close> [...]"))?;
     match verb.as_str() {
         "ping" => Ok(Command::Ping),
         "close" => Ok(Command::Close),
@@ -45,6 +45,39 @@ fn parse_args(args: &[String]) -> Result<Command> {
                 }
             }
             Ok(Command::Snap {
+                interactive,
+                verbose,
+            })
+        }
+        "key" => {
+            let name = iter
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: tvpilot key <name> [count]"))?
+                .clone();
+            let count = match iter.next() {
+                Some(s) => s
+                    .parse::<u32>()
+                    .map_err(|_| anyhow::anyhow!("count must be a positive integer"))?,
+                None => 1,
+            };
+            Ok(Command::Key { name, count })
+        }
+        "click" => {
+            let ref_id = iter
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: tvpilot click <eN> [-i] [-v]"))?
+                .clone();
+            let mut interactive = false;
+            let mut verbose = false;
+            for arg in iter {
+                match arg.as_str() {
+                    "-i" | "--interactive" => interactive = true,
+                    "-v" | "--verbose" => verbose = true,
+                    other => anyhow::bail!("unknown flag for click: {}", other),
+                }
+            }
+            Ok(Command::Click {
+                ref_id,
                 interactive,
                 verbose,
             })
@@ -106,6 +139,19 @@ fn clone_command(c: &Command) -> Command {
             interactive,
             verbose,
         } => Command::Snap {
+            interactive: *interactive,
+            verbose: *verbose,
+        },
+        Command::Key { name, count } => Command::Key {
+            name: name.clone(),
+            count: *count,
+        },
+        Command::Click {
+            ref_id,
+            interactive,
+            verbose,
+        } => Command::Click {
+            ref_id: ref_id.clone(),
             interactive: *interactive,
             verbose: *verbose,
         },
@@ -189,9 +235,19 @@ fn render(resp: Response) {
         Payload::Snap(s) => {
             eprintln!(
                 "[tvpilot] app={} nodes={} detect={}ms walk={}ms total={}ms",
-                s.app_bus, s.node_count, resp.timing.detect_ms, resp.timing.walk_ms, resp.timing.total_ms
+                s.app_bus,
+                s.node_count,
+                resp.timing.detect_ms,
+                resp.timing.walk_ms,
+                resp.timing.total_ms
             );
             print!("{}", s.rendered);
+        }
+        Payload::KeySent { count } => {
+            eprintln!(
+                "[tvpilot] sent {} key event(s) in {}ms",
+                count, resp.timing.total_ms
+            );
         }
     }
 }

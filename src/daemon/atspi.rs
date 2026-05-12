@@ -242,6 +242,85 @@ pub struct RefEntry {
     pub name: String,
 }
 
+/// Read the AT-SPI state bits for one element.
+pub async fn get_state(
+    conn: &Arc<SyncConnection>,
+    sender: &str,
+    path: &str,
+) -> Result<StateBits> {
+    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
+    let (v,): (Vec<u32>,) = proxy
+        .method_call(ATSPI_ACCESSIBLE, "GetState", ())
+        .await
+        .context("GetState")?;
+    Ok(StateBits::from_vec(v))
+}
+
+/// Probe `Action.GetActions` and look for one named "click" or "activate".
+/// Returns its index for `DoAction(idx)`.
+pub async fn find_action(
+    conn: &Arc<SyncConnection>,
+    sender: &str,
+    path: &str,
+) -> Option<i32> {
+    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
+    // GetActions returns a(sss) — array of (name, description, key_binding).
+    let (actions,): (Vec<(String, String, String)>,) = proxy
+        .method_call("org.a11y.atspi.Action", "GetActions", ())
+        .await
+        .ok()?;
+    for (i, (name, _, _)) in actions.iter().enumerate() {
+        let n = name.to_ascii_lowercase();
+        if n == "click" || n == "activate" || n == "default" {
+            return Some(i as i32);
+        }
+    }
+    None
+}
+
+/// Invoke `Action.DoAction(idx)` on the element.
+pub async fn do_action(
+    conn: &Arc<SyncConnection>,
+    sender: &str,
+    path: &str,
+    idx: i32,
+) -> Result<bool> {
+    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
+    let (ok,): (bool,) = proxy
+        .method_call("org.a11y.atspi.Action", "DoAction", (idx,))
+        .await
+        .context("DoAction")?;
+    Ok(ok)
+}
+
+/// `Component.GrabHighlight` — Samsung TV-nav focus (visible highlight cursor).
+pub async fn grab_highlight(
+    conn: &Arc<SyncConnection>,
+    sender: &str,
+    path: &str,
+) -> Result<bool> {
+    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
+    let (ok,): (bool,) = proxy
+        .method_call("org.a11y.atspi.Component", "GrabHighlight", ())
+        .await
+        .context("GrabHighlight")?;
+    Ok(ok)
+}
+
+/// `Component.GrabFocus` — input-focus fallback when highlight isn't supported.
+pub async fn grab_focus(
+    conn: &Arc<SyncConnection>,
+    sender: &str,
+    path: &str,
+) -> Result<bool> {
+    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
+    let (ok,): (bool,) = proxy
+        .method_call("org.a11y.atspi.Component", "GrabFocus", ())
+        .await
+        .context("GrabFocus")?;
+    Ok(ok)
+}
+
 /// Phase 1: concurrent walk → in-memory `Node` tree.
 /// Phase 2: sequential render with monotonic `eN` ref assignment.
 pub async fn walk(
