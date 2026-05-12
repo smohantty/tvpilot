@@ -5,9 +5,12 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+dbus = "0.9"
+dbus-tokio = "0.7"
+tokio = { version = "1", features = ["macros", "rt", "io-util", "net", "time"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
 anyhow = "1"
 
 [profile.release]
