@@ -95,8 +95,9 @@ A single session is assumed (one TV, one foreground app at a time) — no equiva
 | Trigger | Behavior |
 |---|---|
 | First `tvpilot` invocation | CLI connects to socket → fails → re-execs `/proc/self/exe daemon` as detached child → polls socket up to 2 s with backoff → connects → sends request |
-| Subsequent invocations | CLI connects immediately, sends request, exits |
-| Daemon startup | Writes `tvpilot.pid` and `tvpilot.version` sidecars next to the socket. Sets `org.a11y.Status.IsEnabled = true` on the session bus, holds the proxy alive |
+| Subsequent invocations | CLI connects immediately, sends request, exits — no new daemon is spawned |
+| Concurrent cold-start | Two CLIs may both find no socket and both spawn a daemon. The daemon binds the unix socket as its very first action — before pid sidecar, IsEnabled toggle, or AT-SPI proxy. The loser of the `bind(2)` race gets `EADDRINUSE` and exits without side effects. Both CLIs then poll, find the surviving daemon, and connect normally |
+| Daemon startup | Binds the unix socket first (atomic ownership token). On success: writes `tvpilot.pid` and `tvpilot.version` sidecars, sets `org.a11y.Status.IsEnabled = true` on the session bus, holds the proxy alive, then begins accepting connections |
 | `tvpilot close` happy path | CLI sends `Close` over the socket. Daemon sets `IsEnabled = false`, releases bus connection, removes socket + sidecars, exits |
 | `tvpilot close` unreachable-daemon fallback | If the daemon doesn't respond within ~500 ms but the pid in `tvpilot.pid` is alive, CLI sends `SIGKILL` to the pid then removes stale `tvpilot.sock` / `tvpilot.pid` / `tvpilot.version`. Lifted from agent-browser's `run_close_all` |
 | Daemon crash | Next CLI invocation finds stale socket → checks `tvpilot.pid` → if dead, cleans sidecars and re-execs daemon. Response carries `daemon_restarted=true` so the agent knows refs are gone |
