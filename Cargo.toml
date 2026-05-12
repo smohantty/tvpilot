@@ -12,6 +12,7 @@ futures = { version = "0.3", default-features = false, features = ["std", "async
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 anyhow = "1"
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"

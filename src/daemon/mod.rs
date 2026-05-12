@@ -36,12 +36,12 @@ pub async fn run() -> Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await.context("accept")?;
-        let atspi = atspi_conn.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle(stream, atspi, started).await {
-                eprintln!("[tvpilotd] connection error: {:#}", e);
-            }
-        });
+        // Serialize connections. Concurrent CLI access still works (clients
+        // queue at accept()); but only one connection is processed at a time,
+        // which keeps Close clean (no exit() racing other handler tasks).
+        if let Err(e) = handle(stream, atspi_conn.clone(), started).await {
+            eprintln!("[tvpilotd] connection error: {:#}", e);
+        }
     }
 }
 
@@ -60,6 +60,8 @@ async fn handle(
         write_frame(&mut stream, &resp).await?;
         if close {
             stream.shutdown().await.ok();
+            // Unlink the socket so the next auto-spawn binds cleanly.
+            let _ = std::fs::remove_file(socket_path());
             std::process::exit(0);
         }
     }
