@@ -1,63 +1,47 @@
 //! CLI mode: a thin postcard client over the daemon's unix socket.
+//!
+//! Hand-rolled arg parsing — clap is far too heavy for our six-verb surface
+//! under `opt-level="z" + lto + strip + panic=abort`.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
+use std::ffi::OsString;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::proto::{Command, Payload, Request, Response};
+use crate::proto::{Command, Payload, Request, Response, socket_path};
 
-pub fn socket_path() -> PathBuf {
-    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/5001".into());
-    PathBuf::from(format!("{}/tvpilot.sock", runtime))
-}
+const USAGE: &str = "usage: tvpilot <daemon|snap|click|key|ping|close> [...]";
 
-pub async fn run<I: IntoIterator<Item = std::ffi::OsString>>(args: I) -> Result<()> {
-    let args: Vec<String> = args
-        .into_iter()
-        .filter_map(|s| s.into_string().ok())
-        .collect();
+pub async fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<()> {
+    let args: Vec<String> = args.into_iter().filter_map(|s| s.into_string().ok()).collect();
     let cmd = parse_args(&args)?;
-    let resp = send_command(&cmd).await?;
+    let resp = send_command(cmd).await?;
     render(resp);
     Ok(())
 }
 
 fn parse_args(args: &[String]) -> Result<Command> {
-    let mut iter = args.iter();
-    let verb = iter
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("usage: tvpilot <snap|click|key|ping|close> [...]"))?;
-    match verb.as_str() {
+    let mut iter = args.iter().map(String::as_str);
+    let verb = iter.next().ok_or_else(|| anyhow!(USAGE))?;
+
+    match verb {
         "ping" => Ok(Command::Ping),
         "close" => Ok(Command::Close),
         "snap" => {
-            let mut interactive = false;
-            let mut verbose = false;
-            for arg in iter {
-                match arg.as_str() {
-                    "-i" | "--interactive" => interactive = true,
-                    "-v" | "--verbose" => verbose = true,
-                    other => anyhow::bail!("unknown flag for snap: {}", other),
-                }
-            }
-            Ok(Command::Snap {
-                interactive,
-                verbose,
-            })
+            let (interactive, verbose) = parse_iv_flags(iter, "snap")?;
+            Ok(Command::Snap { interactive, verbose })
         }
         "key" => {
             let name = iter
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: tvpilot key <name> [count]"))?
-                .clone();
+                .ok_or_else(|| anyhow!("usage: tvpilot key <name> [count]"))?
+                .to_string();
             let count = match iter.next() {
-                Some(s) => s
-                    .parse::<u32>()
-                    .map_err(|_| anyhow::anyhow!("count must be a positive integer"))?,
+                Some(s) => s.parse().map_err(|_| anyhow!("count must be a positive integer"))?,
                 None => 1,
             };
             Ok(Command::Key { name, count })
@@ -65,28 +49,29 @@ fn parse_args(args: &[String]) -> Result<Command> {
         "click" => {
             let ref_id = iter
                 .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: tvpilot click <eN> [-i] [-v]"))?
-                .clone();
-            let mut interactive = false;
-            let mut verbose = false;
-            for arg in iter {
-                match arg.as_str() {
-                    "-i" | "--interactive" => interactive = true,
-                    "-v" | "--verbose" => verbose = true,
-                    other => anyhow::bail!("unknown flag for click: {}", other),
-                }
-            }
-            Ok(Command::Click {
-                ref_id,
-                interactive,
-                verbose,
-            })
+                .ok_or_else(|| anyhow!("usage: tvpilot click <eN> [-i] [-v]"))?
+                .to_string();
+            let (interactive, verbose) = parse_iv_flags(iter, "click")?;
+            Ok(Command::Click { ref_id, interactive, verbose })
         }
-        _ => Err(anyhow::anyhow!("unknown verb: {}", verb)),
+        other => bail!("unknown verb: {other}"),
     }
 }
 
-async fn send_command(cmd: &Command) -> Result<Response> {
+/// Parse the `-i`/`-v` flag pair shared by `snap` and `click`.
+fn parse_iv_flags<'a>(iter: impl Iterator<Item = &'a str>, verb: &str) -> Result<(bool, bool)> {
+    let (mut interactive, mut verbose) = (false, false);
+    for arg in iter {
+        match arg {
+            "-i" | "--interactive" => interactive = true,
+            "-v" | "--verbose" => verbose = true,
+            other => bail!("unknown flag for {verb}: {other}"),
+        }
+    }
+    Ok((interactive, verbose))
+}
+
+async fn send_command(cmd: Command) -> Result<Response> {
     let sock = socket_path();
     let mut stream = match UnixStream::connect(&sock).await {
         Ok(s) => s,
@@ -100,16 +85,11 @@ async fn send_command(cmd: &Command) -> Result<Response> {
             wait_for_socket(&sock, Duration::from_secs(3))
                 .await
                 .context("daemon did not come up in time")?;
-            UnixStream::connect(&sock)
-                .await
-                .context("connect after spawn")?
+            UnixStream::connect(&sock).await.context("connect after spawn")?
         }
     };
 
-    let req = Request {
-        rid: 1,
-        cmd: clone_command(cmd),
-    };
+    let req = Request { rid: 1, cmd };
     let body = postcard::to_allocvec(&req).context("encode request")?;
     let len = (body.len() as u32).to_le_bytes();
     stream.write_all(&len).await.context("write length")?;
@@ -117,45 +97,11 @@ async fn send_command(cmd: &Command) -> Result<Response> {
     stream.flush().await.ok();
 
     let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .context("read response length")?;
+    stream.read_exact(&mut len_buf).await.context("read response length")?;
     let resp_len = u32::from_le_bytes(len_buf) as usize;
     let mut buf = vec![0u8; resp_len];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .context("read response body")?;
-    let resp: Response = postcard::from_bytes(&buf).context("decode response")?;
-    Ok(resp)
-}
-
-fn clone_command(c: &Command) -> Command {
-    match c {
-        Command::Ping => Command::Ping,
-        Command::Close => Command::Close,
-        Command::Snap {
-            interactive,
-            verbose,
-        } => Command::Snap {
-            interactive: *interactive,
-            verbose: *verbose,
-        },
-        Command::Key { name, count } => Command::Key {
-            name: name.clone(),
-            count: *count,
-        },
-        Command::Click {
-            ref_id,
-            interactive,
-            verbose,
-        } => Command::Click {
-            ref_id: ref_id.clone(),
-            interactive: *interactive,
-            verbose: *verbose,
-        },
-    }
+    stream.read_exact(&mut buf).await.context("read response body")?;
+    postcard::from_bytes(&buf).context("decode response")
 }
 
 fn spawn_daemon_detached() -> Result<()> {
@@ -167,7 +113,7 @@ fn spawn_daemon_detached() -> Result<()> {
     // CLI exits. Best-effort — fall back to /dev/null if the log file can't
     // be created.
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/5001".into());
-    let log_path = format!("{}/tvpilotd.log", runtime);
+    let log_path = format!("{runtime}/tvpilotd.log");
     let (stdout, stderr) = match File::create(&log_path) {
         Ok(f) => {
             let f2 = f.try_clone().ok();
@@ -180,10 +126,7 @@ fn spawn_daemon_detached() -> Result<()> {
     };
 
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon")
-        .stdin(Stdio::null())
-        .stdout(stdout)
-        .stderr(stderr);
+    cmd.arg("daemon").stdin(Stdio::null()).stdout(stdout).stderr(stderr);
 
     // Detach from the parent's controlling terminal and process group. Without
     // setsid the calling shell waits on the daemon's FDs (or its session) and
@@ -214,22 +157,17 @@ async fn wait_for_socket(sock: &Path, timeout: Duration) -> Result<()> {
         }
     }
     Err(anyhow!(
-        "socket {} did not become connectable in {:?}",
+        "socket {} did not become connectable in {timeout:?}",
         sock.display(),
-        timeout
     ))
 }
 
 fn render(resp: Response) {
     match resp.payload {
-        Payload::Pong { uptime_ms } => {
-            println!("pong (daemon up {}ms)", uptime_ms);
-        }
-        Payload::Closed => {
-            println!("daemon closed");
-        }
+        Payload::Pong { uptime_ms } => println!("pong (daemon up {uptime_ms}ms)"),
+        Payload::Closed => println!("daemon closed"),
         Payload::Error(msg) => {
-            eprintln!("error: {}", msg);
+            eprintln!("error: {msg}");
             std::process::exit(1);
         }
         Payload::Snap(s) => {
@@ -239,15 +177,12 @@ fn render(resp: Response) {
                 s.node_count,
                 resp.timing.detect_ms,
                 resp.timing.walk_ms,
-                resp.timing.total_ms
+                resp.timing.total_ms,
             );
             print!("{}", s.rendered);
         }
         Payload::KeySent { count } => {
-            eprintln!(
-                "[tvpilot] sent {} key event(s) in {}ms",
-                count, resp.timing.total_ms
-            );
+            eprintln!("[tvpilot] sent {count} key event(s) in {}ms", resp.timing.total_ms);
         }
     }
 }

@@ -12,12 +12,8 @@ mod proto;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
-    let first = args.next();
-    match first.as_deref().and_then(|s| s.to_str()) {
+    match args.next().as_deref().and_then(|s| s.to_str()) {
         Some("daemon") => daemon::run().await,
-        _ => {
-            let rest: Vec<_> = std::env::args_os().skip(1).collect();
-            cli::run(rest).await
-        }
+        _ => cli::run(std::env::args_os().skip(1)).await,
     }
 }
