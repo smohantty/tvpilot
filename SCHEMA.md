@@ -51,8 +51,7 @@ struct Timing {
 struct DaemonMeta {
     version: String,             // "0.1.0"
     daemon_restarted: bool,      // true on first response after daemon spawn
-    refmap_revision: u32,        // increments on any RefMap mutation
-    snapshot_revision: u32,      // increments on any new snapshot
+    snapshot_revision: u32,      // increments on every new snapshot; refs are scoped to this revision
     window_changed: bool,        // true if active window changed since last response
 }
 ```
@@ -120,7 +119,7 @@ enum KeyName {
 
 enum ColorButton { Red, Green, Yellow, Blue }
 
-type RefId = u32;   // canonical: bare integer. CLI parses "e5", "ref=e5", "@e5" -> 5
+type RefId = String;   // canonical wire form: "e5". CLI accepts "e5", "ref=e5", "@e5" → "e5"
 ```
 
 `Goto` is the highest-level convenience: the daemon searches the current snapshot for an interactive element matching `name` (and `role_hint` if given), then runs the click ladder against it. This is the agent's "I don't care which ref, just press the thing labelled X" verb.
@@ -249,12 +248,11 @@ Same `Snapshot` struct serialized to JSON. `RefId` becomes `"e5"` strings in JSO
 ## Refs in detail
 
 ```rust
-type RefId = u32;            // wire form: integer
-                              // CLI display: "e{N}"
+type RefId = String;         // canonical wire form: "e5"
                               // CLI input accepts "e5" | "ref=e5" | "@e5"
 ```
 
-Inside the daemon, a `RefEntry` carries enough state to re-resolve a stale element:
+Inside the daemon, a `RefEntry` carries just enough state to drive an action on the current tree:
 
 ```rust
 struct RefEntry {
@@ -262,27 +260,18 @@ struct RefEntry {
     object_path: String,       // "/org/a11y/atspi/accessible/2147496315"
     role:        String,
     name:        String,
-    parent_name: String,       // helps disambiguation when name dupes across windows
-    nth:         u16,          // 0-based count of (role,name) duplicates
-    window_id:   u32,          // hash of WindowInfo; for invalidation
-    last_seen:   Instant,      // tombstone timer
-    handle:      [u8; 16],     // blake3 truncated; identity for session-stable id
 }
 ```
 
 Lifecycle:
 
-- A `RefId` lives at least one snapshot cycle in the daemon's `RefMap`.
-- On each new snapshot, the daemon recomputes handles. Existing handles keep their `RefId`. New handles get the next free integer.
-- A handle that disappears is **tombstoned** for 60 seconds; if it reappears, the same `RefId` is reused.
-- On window-stack change, `window_changed=true` is reported but refs survive — only refs whose `window_id` no longer matches a visible window are tombstoned.
-- On `Reset`, the whole map clears and refs restart at `e1`.
+- The `RefMap` is **cleared at the start of every snapshot computation**. Refs are assigned in tree-traversal order: first ref-bearing node is `"e1"`, second `"e2"`, and so on.
+- A ref's lifetime is one snapshot. Once the daemon emits a new snapshot, all refs from the previous one are gone.
+- An agent that holds a ref across snapshots and sends it back to the daemon receives `Err(RefUnknown)` plus the current snapshot, so it can re-look without an extra round trip.
+- On window-stack change, `window_changed=true` is reported on the next snapshot. There is nothing extra to invalidate — refs are already implicitly invalidated by the per-snapshot clear.
+- `Reset` clears the focus-graph cache and forces a fresh snapshot; the `RefMap` clear is already implied by taking a new snapshot.
 
-When the CLI sends `Click { ref_: 5 }` and the cached `(bus_name, object_path)` errors (`UnknownObject`, role mismatch, defunct state), the daemon recovers:
-
-1. Issue `org.a11y.atspi.Collection.GetMatches` on the recorded `window_id`'s app root, matching by `role + name + parent_name`.
-2. If exactly one match (or `nth`-th match if dupes): update `RefEntry`, retry.
-3. If zero matches: respond `Err(REF_STALE)` with a fresh snapshot suggesting the agent re-look.
+No recovery path exists. Stale refs are an `Err(RefUnknown)` with a fresh snapshot attached, not a `Collection.GetMatches` search. This is intentional: duplicate sibling roles/names, transient overlays, and reordered dynamic lists all defeat handle-based recovery in ways that quietly bind the same ref to the wrong element. The simpler "refs are per-snapshot" rule cannot make that mistake.
 
 ---
 
@@ -300,24 +289,21 @@ enum ErrorCode {
     // Wire / lifecycle
     BadFrame,                 // postcard decode failed
     UnknownCommand,
-    Busy,                     // daemon already serving another connection
     DaemonNotReady,           // a11y bus not yet usable
 
     // Refs
-    RefUnknown,               // ref id never existed in this session
-    RefStale,                 // ref existed but element gone, returned with fresh snapshot
-    RefAmbiguous,             // collection match returned multiple after recovery
+    RefUnknown,               // ref is not in the current snapshot (never assigned, or stale from an earlier snapshot)
 
     // Actions
     ActionUnsupported,        // requested DoAction name not in element's actions
-    NotFocusable,             // GrabHighlight rejected, no LRUD fallback wanted
+    NotFocusable,             // GrabHighlight/GrabFocus rejected, no LRUD fallback wanted
     PathNotFound,             // LRUD navigation failed within budget
     TextNotEditable,
     ValueOutOfRange,
 
     // Key injection
     KeyUnknown,
-    KeyInjectFailed,          // uinput / wayland virtual keyboard write failed
+    KeyInjectFailed,          // efl_util input generator write failed
 
     // D-Bus
     A11yBusUnavailable,
@@ -327,7 +313,7 @@ enum ErrorCode {
 
     // Snapshot
     DumpTreeFailed,
-    DumpTreeMalformed,        // lz4/base64/json parse failed
+    DumpTreeMalformed,        // lz4 / base64 / json parse failed
 
     // Catch-all
     Internal,
@@ -396,7 +382,7 @@ Request {
     ]
   },
   "timing": { "total_us": 18420, "dbus_us": 16100, "pathfind_us": 0 },
-  "daemon_meta": { "version": "0.1.0", "daemon_restarted": false, "refmap_revision": 12, "snapshot_revision": 12, "window_changed": false }
+  "daemon_meta": { "version": "0.1.0", "daemon_restarted": false, "snapshot_revision": 12, "window_changed": false }
 }
 ```
 
@@ -417,16 +403,16 @@ pkg=org.tizen.tv-viewer  win=tv-viewer-graphics  focus=e7  rev=13  changed=false
 - slider* "Volume" 38/100        [ref=e7]
 ```
 
-### `tvpilot click e99` (stale ref)
+### `tvpilot click e99` (stale ref from a prior snapshot)
 
 **Response (JSON):**
 ```json
 {
   "rid": 7,
   "result": { "Err": {
-    "code": "RefStale",
-    "msg": "Element e99 (slider 'Volume') no longer present after window change",
-    "hint": "re-snapshot and reselect",
+    "code": "RefUnknown",
+    "msg": "Ref e99 is not present in the current snapshot",
+    "hint": "re-look using the attached snapshot and reselect",
     "retryable": false
   } },
   "snapshot": { ... fresh snapshot ... },

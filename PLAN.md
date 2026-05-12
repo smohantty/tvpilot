@@ -17,12 +17,25 @@ Two implications:
 
 ## What it optimizes for
 
-In priority order:
+Two meta-objectives drive every design choice below: **per-turn performance** (an agent waiting on tvpilot is a tvpilot bug) and **on-device memory footprint** (daemon RSS, binary size, allocation churn per command). When a choice trades one for another concern, perf and memory win. In priority order:
 
-1. **Agent context size.** A snapshot the agent reads on every turn must be ~25× smaller than Aurum's `DumpObjectTree` output. We pay engineering cost upfront — strip non-actionable nodes, role-name dedup with `nth`, single-line elements, no doubled state encoding — so the agent pays fewer tokens forever.
-2. **Per-turn latency.** Use the `atspi_accessible_dump_tree` D-Bus fast path (one round trip, LZ4 + base64) instead of walking the tree node-by-node. Target <50 ms for a typical snapshot, <30 ms for the common click path.
-3. **On-device footprint.** One static-ish multicall binary (CLI and daemon modes in the same executable, dispatched in `main()` on argv[1]). No dependency on libatspi, libdbus-glib, libglib, libgio. Direct D-Bus via `zbus`. Target size: ~1.5-2 MB total.
-4. **Zero on-target prerequisites beyond the TV's existing D-Bus.** No new system service to install, no GMainLoop thread to babysit.
+1. **Agent context size.** A snapshot the agent reads on every turn is small and ref-shaped — strip non-actionable nodes, role-name dedup with `nth`, single-line elements, no doubled state encoding. The goal is to make context the cheap part of every agent turn. Specific size ratios versus Aurum's `DumpObjectTree` will be reported once measured on target.
+2. **Per-turn latency.** Use the `atspi_accessible_dump_tree` D-Bus fast path (one round trip, LZ4 + base64 payload) instead of walking the tree node-by-node. After actions, wait for the `window:post-render` event so the returned snapshot reflects the post-action state, not the pre-action state. Concrete latency budgets are deferred until measured on target.
+3. **On-device footprint.** One static-ish multicall binary (CLI and daemon modes in the same executable, dispatched in `main()` on argv[1]). No dependency on `libatspi`, `libdbus-glib`, `libglib`/`libgio`. Direct D-Bus via `zbus`. Target size: ~1.5-2 MB total.
+4. **Zero on-target prerequisites beyond what the TV already has.** AT-SPI registry/bus, `libefl-util` for key injection (per Aurum's working path), `libecore-wl2` for display geometry. No new system service to install, no GMainLoop thread to babysit.
+
+### Memory and performance discipline
+
+A few concrete rules that follow from the meta-objectives, applied throughout the implementation:
+
+- **Single-binary multicall** with daemon-only deps lazy-init'd out of the CLI hot path. Cold CLI start is dominated by `exec()` and dynamic linking, not crate init.
+- **Per-snapshot `RefMap`**: cleared at the start of every snapshot, no long-lived ref table, no tombstone GC, no recovery search. Bounded, predictable memory.
+- **Single in-flight request**: the daemon serializes commands behind one mutex. No request-queue depth to bound, no concurrent state machine.
+- **Postcard wire format** on the socket — compact, allocation-light, no JSON encode/decode on the hot path (JSON renders only at the CLI's text boundary).
+- **Direct `zbus`, no GLib/GIO/libatspi.** Daemon stays a single static-ish binary, no GMainLoop thread.
+- **`atspi_accessible_dump_tree` fast path**: one D-Bus round trip per snapshot, LZ4 + base64 payload, never a node-by-node walk.
+- **No persistent caches** except the focus-graph, which is bounded by screen signature and dropped on window change.
+- **No async runtime in the CLI**: blocking unix-socket I/O only; `tokio` is daemon-side.
 
 ## Architecture
 
@@ -102,19 +115,30 @@ A single session is assumed (one TV, one foreground app at a time) — no equiva
 | `tvpilot close` unreachable-daemon fallback | If the daemon doesn't respond within ~500 ms but the pid in `tvpilot.pid` is alive, CLI sends `SIGKILL` to the pid then removes stale `tvpilot.sock` / `tvpilot.pid` / `tvpilot.version`. Lifted from agent-browser's `run_close_all` |
 | Daemon crash | Next CLI invocation finds stale socket → checks `tvpilot.pid` → if dead, cleans sidecars and re-execs daemon. Response carries `daemon_restarted=true` so the agent knows refs are gone |
 | Version skew (CLI vs running daemon) | CLI reads `tvpilot.version` before connecting. On mismatch, sends `Close`, waits, then re-execs the matching daemon |
-| Concurrent CLI access | Daemon accepts only one connection at a time; second connection gets `BUSY` and is told to retry |
+| Concurrent CLI access | Daemon accepts multiple connections; commands are serialized behind an internal mutex. A second CLI that connects while the first is mid-command simply waits — no `BUSY` error. The response's `snapshot_revision` lets the second CLI's agent detect "the world moved while I was waiting" |
 
 The CLI and daemon share crate code but mode-specific paths are gated so the CLI's cold-start cost stays dominated by `exec()` and dynamic linking, not by daemon-side crate init.
 
-## Direct D-Bus, no libatspi
+## Talking to AT-SPI
 
-We talk to AT-SPI as a pure D-Bus client via `zbus`. No `libatspi` on disk, no `libdbus-glib`, no GLib/GIO. Verified end-to-end on the live target:
+We talk to AT-SPI as a pure D-Bus client via `zbus`. No `libatspi` on disk, no `libdbus-glib`, no GLib/GIO. The end-to-end path was proven in a prior PoC against the live target:
 
 - AT-SPI bus is a regular unix socket at `/run/user/<uid>/at-spi/bus`.
-- Standard `org.a11y.atspi.*` interfaces are introspectable and work.
-- Samsung's Tizen extensions (`DumpTree`, `GetNodeInfo`, `GetStringProperty`, `GetNeighbor`, `SetIncludeHidden`, `SetListenPostRender`, `DoGesture`) are exposed as plain D-Bus methods on the standard `org.a11y.atspi.Accessible` interface — no hidden Samsung-only interface, no FFI required.
+- Standard `org.a11y.atspi.*` interfaces are introspectable and callable over plain D-Bus.
+- Samsung's Tizen extensions (`DumpTree`, `GetNodeInfo`, `GetStringProperty`, `GetNeighbor`, `SetIncludeHidden`, `SetListenPostRender`, `DoGesture`) are exposed as plain D-Bus methods on the standard `org.a11y.atspi.Accessible` interface — Aurum's code at the C-API level confirms there is no hidden Samsung-only D-Bus interface.
+- `IsEnabled` on the **session bus** is toggled by plain `Properties.Set` on `org.a11y.Bus`. Aurum's reference uses GDBus over the session bus for the exact same property write, so there is no `kdbus` requirement and no need for a `libdbus-1` dependency for this one call.
 
-The single transport-level wrinkle is the `IsEnabled` toggle on the **session bus**, which on Tizen TV is kdbus-only (zbus does not speak kdbus). The daemon resolves this with a minimal `dbus` crate dependency (libdbus-1, Samsung-patched on Tizen, already on disk) used solely for that one property write at startup and shutdown. Everything else is `zbus` over the unix-socket AT-SPI bus.
+The implementation revisits this only if a specific zbus call surprises us on target during 0.1 work. We are not currently planning a `libatspi` fallback path.
+
+## Key injection
+
+Raw keys go through Tizen's input generator service via `libefl-util`, mirroring Aurum's working path:
+
+- `efl_util_input_initialize_generator(EFL_UTIL_INPUT_DEVTYPE_KEYBOARD)` once at daemon startup.
+- `efl_util_input_generate_key(handle, "Down", 1)` for press, `0` for release. Repeat sleeps are caller-controlled (`tvpilot key down 3` issues three press/release pairs).
+- Touch and pointer generators (`EFL_UTIL_INPUT_DEVTYPE_TOUCHSCREEN`, `EFL_UTIL_INPUT_DEVTYPE_POINTER`) are out of scope for v0.1 but the same library exposes them when we want them.
+
+`uinput` and Wayland virtual keyboard are **not** used — they're either privileged differently or absent on retail Tizen TV. The earlier "uinput / Wayland" framing in this doc was wrong.
 
 ## Surface (commands)
 
@@ -175,10 +199,18 @@ So the agent learns navigation cost over time and decides whether to nav now or 
 
 ## Ref design (lifted from agent-browser)
 
-- Format: `eN`, e.g. `e5`, `e23`. CLI accepts `e5`, `ref=e5`, `@e5`.
-- Each ref entry stores enough recovery metadata that the daemon can re-resolve the element if its D-Bus path goes stale: `(bus_name, object_path, role, name, parent_name, nth, window_id)`. Cached path tried first; on `UnknownObject` or role mismatch, the daemon re-queries via `Collection.GetMatches`.
-- IDs are **session-stable via handle hash**. Handle = `blake3(role + name + parent_name + window_id)` → small int. The same element keeps the same ref across snapshots while it exists. New elements get the next free int; disappeared refs get tombstoned for N turns before being freed.
-- On window-stack change (a new top-level window activates), the snapshot header carries `changed=true` so the agent knows part of the refmap may have shifted.
+- Format: `eN`, e.g. `e5`, `e23`. CLI accepts `e5`, `ref=e5`, `@e5`. Wire form is the same string.
+- Refs are **per-snapshot, monotonic, and cleared on every new snapshot.** This matches agent-browser's actual implementation. The daemon assigns refs in tree-traversal order: first ref-bearing node is `e1`, second `e2`, and so on. The `RefMap` is emptied at the start of every snapshot computation.
+- Each `RefEntry` stores just enough to drive an action on the current tree: `(bus_name, object_path, role, name)`. No `parent_name`, `nth`, `window_id`, blake3 handle, or tombstone state — none are needed when a ref's lifetime is bounded by one snapshot.
+- After an action (`click`, `focus`, `text`, `value`, `do`, `goto`), the daemon takes a fresh snapshot before responding. The response carries that new snapshot, which has its own ref space starting again at `e1`. Refs are scoped to the snapshot they came from.
+- If the agent reuses an old ref after a new snapshot has invalidated it, the daemon responds `Err(RefUnknown)` with the current snapshot attached, so the agent can re-look without an extra round trip.
+- On window-stack change (a new top-level window activates), the next snapshot's header carries `window_changed=true`. Refs are already implicitly invalidated by the per-snapshot clear; the flag just lets the agent know its mental model of "the screen" has shifted.
+
+This trades session stability for simplicity. The cost: an agent that wants to remember "the volume slider" across snapshots must re-identify it by role + name each turn. The benefits:
+
+- No collision risk on duplicate sibling roles/names (the original blake3 scheme aliased two identical buttons under the same parent).
+- No tombstone GC and no `Collection.GetMatches` recovery path against an AT-SPI match-rule that may not even be expressible.
+- No "the same ref now points at a different element" footgun across snapshot boundaries.
 
 ## Role classification
 
@@ -192,18 +224,20 @@ The TV equivalent of agent-browser's "cursor-interactive promotion" is **focus-c
 
 ## Click ladder (the navigation problem)
 
+Tizen TVs distinguish two related concepts: **highlight** (the visible TV-navigation focus that moves with LRUD keys, usually shown by a glow/scale animation) and **input focus** (the AT-SPI state that determines where keyboard events route). Aurum keeps them separate, and so do we — they map to `Component.GrabHighlight()` and `Component.GrabFocus()` respectively.
+
 Every `click <ref>` runs this ladder, stopping at the first rung that succeeds:
 
-1. Resolve `<ref>` → live `AtspiAccessible` (RefMap recovery if path stale)
-2. Already focused? → send `Enter` key → done
-3. Has accessible action with name `click` / `activate`? → `DoActionName(...)` → done
-4. Focusable directly? → `Component.GrabHighlight()` → send `Enter` → done
+1. Resolve `<ref>` → live `AtspiAccessible` from the current snapshot's `RefMap`. If the ref isn't there, return `Err(RefUnknown)` with a fresh snapshot.
+2. Already highlighted? → send `Enter` key → done.
+3. Has an accessible action named `click` / `activate`? → `DoActionName(...)` → done.
+4. Highlightable directly? → `GrabHighlight()` (TV-nav focus), then `Enter` → done. If the element does not support highlight, fall back to `GrabFocus()` + `Enter`.
 5. LRUD pathfinding:
-   - **Online spatial greedy** first: compute target direction from current focus, press best key, observe new focus, accept on progress, retry with second-best on no-op. Cap at 12 steps.
-   - **Focus-graph BFS** if step 5a stalls or has already failed on this screen: dry-walk the focus chain via successive key presses, build a directed graph keyed by `(node, direction)`, BFS to target, replay keys. Cache the graph by screen signature.
-6. Take fresh snapshot, attach `path=...` header, respond.
+   - **Online spatial greedy** first: compute target direction from current highlight, press best key, observe the new highlight, accept on progress, retry with second-best on no-op. Cap at 12 steps.
+   - **Focus-graph BFS** if step 5a stalls or has already failed on this screen: dry-walk the highlight chain via successive key presses, build a directed graph keyed by `(node, direction)`, BFS to target, replay keys. Cache the graph by screen signature.
+6. After the action fires, toggle `SetListenPostRender(true)`, wait for the `window:post-render` event (with a timeout), toggle it back off, then take a fresh snapshot. Attach the `path=...` header in the response.
 
-Most clicks land at rungs 2-4 (free). Rung 5 is the bounded fallback.
+Most clicks land at rungs 2-4. Rung 5 is the bounded fallback. The post-render wait at rung 6 is what makes the returned snapshot reflect the resulting UI state rather than the pre-action state.
 
 ## Batching (`tvpilot batch`)
 
@@ -229,23 +263,24 @@ The per-action auto-snapshot makes batching less critical than in `agent-browser
 
 ## Out of scope (this phase)
 
-- Screenshots (image capture requires Wayland/TBM bindings; punt to v2 or shell out to Aurum)
+- Screenshots (image capture requires Wayland/TBM bindings; punt to v0.2 or shell out to Aurum)
 - App install / uninstall (Tizen `pkgmgr` integration is a separate concern)
 - App launch via deeplinks (this is what the original tvpilot scope was; we may layer it back on top later)
 - TV control (volume, channel, input source) — except via `tvpilot key`, which is sufficient for now
 - Recording / replay
-- Multi-CLI concurrent access
 - Cross-target federation
 - Public language bindings (single-process exec is the only interface)
+- **Overlay-aware ref preservation across window-stack changes** (e.g., a transient volume OSD popping over the main app). For v0.1 we trust AT-SPI window events; Aurum's `org.enlightenment.wm GetVisibleWinInfo_v3` side channel is a v0.2 enhancement
 
 ## Roadmap
 
 | Phase | Deliverable |
 |---|---|
-| 0.1 | Daemon connects to AT-SPI bus, owns IsEnabled, accepts unix socket, responds to `ping`. CLI auto-spawns daemon. |
-| 0.2 | `snap` returns compact text snapshot via `DumpTree` fast path + LZ4 decode. RefMap with role+name+nth. |
-| 0.3 | `click` ladder rungs 1-4 (direct + GrabHighlight). `key` raw injection via Wayland virtual keyboard or uinput (whichever the TV exposes). |
-| 0.4 | LRUD pathfinding (spatial greedy). Focus-graph BFS as fallback. |
-| 0.5 | `batch` mode, session-stable ref hashing, `--diff`. |
-| 0.6 | Field hardening with real agent traffic. Performance tuning. |
-| 1.0 | Stable wire schema, documented public commands. |
+| 0.0 | Cargo-tizen project scaffold, armv7l release build, install to target via `rsdb`, smoke test. |
+| 0.1 | Daemon connects to AT-SPI bus via `zbus`, owns IsEnabled via plain session-bus property write, accepts unix socket, responds to `ping`. CLI auto-spawns daemon. |
+| 0.2 | `snap` returns compact text snapshot via `DumpTree` fast path + LZ4 + base64 decode. Per-snapshot `RefMap` (monotonic, cleared each snapshot). |
+| 0.3 | `click` ladder rungs 1-4 (direct AT-SPI action, `GrabHighlight`, `GrabFocus`). `key` raw injection via `libefl-util` (`efl_util_input_generate_key`). |
+| 0.4 | LRUD pathfinding (spatial greedy). Focus-graph BFS as fallback. `SetListenPostRender` + `window:post-render` wait around actions. |
+| 0.5 | `batch` mode, snapshot `--diff` (text diff against previous), `goto` verb. |
+| 0.6 | Field hardening with real agent traffic. Performance and memory measurement against the meta-objectives. |
+| 1.0 | Stable wire schema, documented public commands. Overlay-aware refs via WM side channel. |
