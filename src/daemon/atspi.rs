@@ -366,17 +366,29 @@ fn render(
         let name_part = if node.name.is_empty() {
             String::new()
         } else {
-            format!(" \"{}\"", node.name)
+            format!(" \"{}\"{}", node.name, marker)
         };
-        let flags_part = if verbose {
-            format!(" [{}]", node.state.short_flags())
+        if verbose {
+            // Diagnostic line: role + state flags surfaced.
+            let flags_part = format!(" [{}]", node.state.short_flags());
+            out.push_str(&format!(
+                "{}- {}{}{} [ref={}]\n",
+                pad, node.role, name_part, flags_part, ref_id
+            ));
         } else {
-            String::new()
-        };
-        out.push_str(&format!(
-            "{}- {}{}{}{} [ref={}]\n",
-            pad, node.role, marker, name_part, flags_part, ref_id
-        ));
+            // Default: minimal — name + focus marker + ref. Role string is
+            // omitted because on Tizen Dali widgets it is uniformly
+            // "unknown" and adds no decision signal for the agent. The
+            // role-tier classifier still runs invisibly to decide
+            // ref-bearing and interactivity.
+            if node.name.is_empty() {
+                // No name: surface the role so the agent at least sees
+                // *something*. This is rare given our ref-bearing rule.
+                out.push_str(&format!("{}- {} [ref={}]\n", pad, node.role, ref_id));
+            } else {
+                out.push_str(&format!("{}-{} [ref={}]\n", pad, name_part, ref_id));
+            }
+        }
         *total += 1;
         indent + 1
     } else {
