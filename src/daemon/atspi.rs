@@ -149,8 +149,15 @@ impl StateBits {
     }
 }
 
-fn proxy<'a>(conn: &Arc<SyncConnection>, sender: &str, path: &str) -> Proxy<'a, Arc<SyncConnection>> {
-    Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone())
+/// Borrowed-string proxy constructor. `Proxy::method_call` builds a fully-owned
+/// `Message` synchronously and returns a future that does NOT borrow from the
+/// proxy, so we can hand it `&str` and let the proxy drop right after the call.
+fn proxy<'a>(
+    conn: &Arc<SyncConnection>,
+    sender: &'a str,
+    path: &'a str,
+) -> Proxy<'a, Arc<SyncConnection>> {
+    Proxy::new(sender, path, TIMEOUT, conn.clone())
 }
 
 /// Connect to the AT-SPI bus (plain unix socket on Tizen).
@@ -205,13 +212,19 @@ pub async fn find_active_app(
     conn: &Arc<SyncConnection>,
     apps: &[(String, String)],
 ) -> Option<(String, String)> {
+    // Borrow the bus name + path into the probe; clone only on the (rare)
+    // success. The probe future doesn't borrow from the proxy, so the strings
+    // only need to live across the single method_call dispatch.
     let probes = apps.iter().map(|(s, p)| {
-        let (s, p, conn) = (s.clone(), p.clone(), conn.clone());
+        let conn = conn.clone();
         async move {
-            let pr = proxy(&conn, &s, &p);
-            let (state,): (Vec<u32>,) =
-                pr.method_call(ATSPI_ACCESSIBLE, "GetState", ()).await.ok()?;
-            StateBits::from_vec(state).active().then_some((s, p))
+            let (state,): (Vec<u32>,) = proxy(&conn, s, p)
+                .method_call(ATSPI_ACCESSIBLE, "GetState", ())
+                .await
+                .ok()?;
+            StateBits::from_vec(state)
+                .active()
+                .then(|| (s.clone(), p.clone()))
         }
     });
     futures::future::join_all(probes).await.into_iter().flatten().next()
@@ -221,9 +234,13 @@ pub async fn find_active_app(
 /// assigned — that happens deterministically in a sequential render pass so
 /// `eN` ids match tree-traversal order regardless of which `tokio::join!`
 /// future finished first.
+///
+/// `sender` is interned as `Arc<str>` once per app and shared with every
+/// descendant; `path` is interned per node. Cloning into the refmap is then
+/// a refcount bump rather than a heap allocation.
 pub struct Node {
-    pub sender: String,
-    pub path: String,
+    pub sender: Arc<str>,
+    pub path: Arc<str>,
     pub role: String,
     pub name: String,
     pub state: StateBits,
@@ -235,8 +252,8 @@ pub struct Node {
 /// per PLAN.md "Ref design".
 #[derive(Clone)]
 pub struct RefEntry {
-    pub sender: String,
-    pub path: String,
+    pub sender: Arc<str>,
+    pub path: Arc<str>,
     pub role: String,
     pub name: String,
 }
@@ -321,6 +338,11 @@ pub async fn walk(
     interactive_only: bool,
     verbose: bool,
 ) -> (String, u32, Vec<RefEntry>) {
+    // Intern at the walk root; every descendant either reuses the same
+    // `Arc<str>` (same bus, common case) or allocates a fresh one (rare
+    // cross-app proxy children).
+    let sender: Arc<str> = Arc::from(sender);
+    let path: Arc<str> = Arc::from(path);
     let root = build_tree(conn, sender, path).await;
     let mut refmap = Vec::new();
     let mut out = String::new();
@@ -331,8 +353,8 @@ pub async fn walk(
 
 fn build_tree(
     conn: Arc<SyncConnection>,
-    sender: String,
-    path: String,
+    sender: Arc<str>,
+    path: Arc<str>,
 ) -> BoxFuture<'static, Node> {
     async move {
         let pr = proxy(&conn, &sender, &path);
@@ -368,9 +390,20 @@ fn build_tree(
             };
         }
 
-        let child_futs = children_pairs
-            .into_iter()
-            .map(|(cs, cp)| build_tree(conn.clone(), cs, cp.to_string()));
+        // Reuse the parent's interned bus name when the child reports the
+        // same — the common case for an in-app subtree. Cross-app proxy
+        // nodes fall through and allocate a fresh `Arc<str>`.
+        let child_futs = children_pairs.into_iter().map(|(cs, cp)| {
+            let child_sender = if cs.as_str() == sender.as_ref() {
+                Arc::clone(&sender)
+            } else {
+                Arc::<str>::from(cs)
+            };
+            // `dbus::Path<'static>` derefs to `str`; intern as `Arc<str>`
+            // so the later refmap push is a refcount bump.
+            let child_path: Arc<str> = Arc::from(&*cp);
+            build_tree(conn.clone(), child_sender, child_path)
+        });
         let children = futures::future::join_all(child_futs).await;
 
         Node {
@@ -413,6 +446,8 @@ fn render(
     interactive_only: bool,
     verbose: bool,
 ) {
+    use std::fmt::Write as _;
+
     if !node.state.showing() {
         return;
     }
@@ -422,38 +457,44 @@ fn render(
 
     let next_indent = if surface {
         let ref_idx = refmap.len() + 1;
-        let ref_id = format!("e{ref_idx}");
         refmap.push(RefEntry {
-            sender: node.sender.clone(),
-            path: node.path.clone(),
+            sender: Arc::clone(&node.sender),
+            path: Arc::clone(&node.path),
             role: node.role.clone(),
             name: node.name.clone(),
         });
 
-        let pad = " ".repeat(indent * 2);
+        // Stream directly into `out` — no intermediate `pad`/`name_part`
+        // String allocations. `write!` on `String` is infallible, so we
+        // discard the `Result`.
+        for _ in 0..indent {
+            out.push_str("  ");
+        }
         let marker = if node.state.focused() { "*" } else { "" };
-        let name_part = if node.name.is_empty() {
-            String::new()
-        } else {
-            format!(" \"{}\"{marker}", node.name)
-        };
-        if verbose {
-            // Diagnostic line: role + state flags surfaced.
-            let flags = node.state.short_flags();
-            out.push_str(&format!(
-                "{pad}- {}{name_part} [{flags}] [ref={ref_id}]\n",
-                node.role,
-            ));
+
+        let _ = if verbose {
+            if node.name.is_empty() {
+                writeln!(out, "- {} [{}] [ref=e{ref_idx}]", node.role, node.state.short_flags())
+            } else {
+                writeln!(
+                    out,
+                    "- {} \"{}\"{marker} [{}] [ref=e{ref_idx}]",
+                    node.role,
+                    node.name,
+                    node.state.short_flags(),
+                )
+            }
         } else if node.name.is_empty() {
             // No name: surface the role so the agent at least sees
             // *something*. Rare given our ref-bearing rule.
-            out.push_str(&format!("{pad}- {} [ref={ref_id}]\n", node.role));
+            writeln!(out, "- {} [ref=e{ref_idx}]", node.role)
         } else {
             // Default: minimal — name + focus marker + ref. Role is omitted
             // because on Tizen Dali widgets it is uniformly "unknown" and
             // adds no decision signal for the agent.
-            out.push_str(&format!("{pad}-{name_part} [ref={ref_id}]\n"));
-        }
+            writeln!(out, "- \"{}\"{marker} [ref=e{ref_idx}]", node.name)
+        };
+
         *total += 1;
         indent + 1
     } else {

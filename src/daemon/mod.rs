@@ -242,25 +242,29 @@ async fn do_snap(
     let results = futures::future::join_all(walks).await;
     timing.walk_ms = t.elapsed().as_millis() as u32;
 
+    // Consume both `targets` and `results` by value so refmap entries can be
+    // moved into the combined vector instead of cloned, and the chosen-app
+    // bus name moves into `chosen_bus` without an extra allocation.
+    use std::fmt::Write as _;
     let mut rendered = String::new();
     let mut node_count = 0u32;
     let mut chosen_bus = String::new();
     let mut chosen_nodes = 0u32;
     let mut combined_refmap: Vec<RefEntry> = Vec::new();
-    for ((sender, _), (r, c, rm)) in targets.iter().zip(results.iter()) {
+    for ((sender, _), (r, c, rm)) in targets.into_iter().zip(results) {
         node_count += c;
-        if *c == 0 {
+        if c == 0 {
             continue;
         }
-        if *c > chosen_nodes {
-            chosen_bus = sender.clone();
-            chosen_nodes = *c;
-        }
         if !r.is_empty() {
-            rendered.push_str(&format!("# app={sender}\n"));
-            rendered.push_str(r);
+            let _ = writeln!(&mut rendered, "# app={sender}");
+            rendered.push_str(&r);
         }
-        combined_refmap.extend(rm.iter().cloned());
+        combined_refmap.extend(rm);
+        if c > chosen_nodes {
+            chosen_nodes = c;
+            chosen_bus = sender;
+        }
     }
 
     // Publish the RefMap so subsequent `click`/`focus` can resolve refs.
