@@ -1,0 +1,24 @@
+[package]
+name = "libdbus-sys"
+version = "0.2.7"
+edition = "2021"
+description = "FFI bindings to libdbus, loaded at runtime via dlopen (no build-time libdbus dependency)."
+license = "Apache-2.0 OR MIT"
+
+# NOTE: this is a tvpilot-internal fork of `libdbus-sys` 0.2.7. The upstream
+# crate links against libdbus-1 at build time via pkg-config. This fork
+# replaces every `extern "C"` declaration with a thin wrapper that resolves
+# the symbol lazily via dlopen/dlsym at runtime — so cross-compiling
+# tvpilot requires nothing libdbus-related in the sysroot, while the target
+# (Tizen) still provides libdbus-1.so.3 and its kdbus transport.
+#
+# Version is pinned to 0.2.7 to match dbus 0.9.11's exact-version dependency.
+
+# No `links = "dbus"` — the binary will carry no DT_NEEDED for libdbus-1.
+
+[dependencies]
+libc = "0.2"
+
+[lib]
+name = "libdbus_sys"
+path = "src/lib.rs"

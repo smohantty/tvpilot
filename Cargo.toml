@@ -20,3 +20,13 @@ lto = true
 codegen-units = 1
 strip = true
 panic = "abort"
+
+# Patch the libdbus-sys FFI shim to a tvpilot-local fork that resolves
+# every libdbus symbol via dlopen/dlsym at runtime instead of linking at
+# build time. The version must match dbus 0.9.11's exact-version
+# dependency on libdbus-sys 0.2.7. Net effect: no DT_NEEDED for
+# libdbus-1.so.3 in our binary, no libdbus headers needed in the
+# cross-compile sysroot. The target's libdbus (with its kdbus transport)
+# is loaded at runtime.
+[patch.crates-io]
+libdbus-sys = { path = "vendor/libdbus-sys" }
