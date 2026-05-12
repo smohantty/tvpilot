@@ -312,8 +312,7 @@ enum ErrorCode {
     DbusInvalidReply,
 
     // Snapshot
-    DumpTreeFailed,
-    DumpTreeMalformed,        // lz4 / base64 / json parse failed
+    WalkFailed,               // recursive AT-SPI tree walk hit an unrecoverable D-Bus error
 
     // Catch-all
     Internal,

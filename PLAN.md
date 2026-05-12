@@ -20,7 +20,7 @@ Two implications:
 Two meta-objectives drive every design choice below: **per-turn performance** (an agent waiting on tvpilot is a tvpilot bug) and **on-device memory footprint** (daemon RSS, binary size, allocation churn per command). When a choice trades one for another concern, perf and memory win. In priority order:
 
 1. **Agent context size.** A snapshot the agent reads on every turn is small and ref-shaped — strip non-actionable nodes, role-name dedup with `nth`, single-line elements, no doubled state encoding. The goal is to make context the cheap part of every agent turn. Specific size ratios versus Aurum's `DumpObjectTree` will be reported once measured on target.
-2. **Per-turn latency.** Use the `atspi_accessible_dump_tree` D-Bus fast path (one round trip, LZ4 + base64 payload) instead of walking the tree node-by-node. After actions, wait for the `window:post-render` event so the returned snapshot reflects the post-action state, not the pre-action state. Concrete latency budgets are deferred until measured on target.
+2. **Per-turn latency.** The path is a recursive walk of `org.a11y.atspi.Accessible` (`GetChildren` + `GetRoleName` + `Name` property + `GetState`) — proven via target spike. No `DumpTree` D-Bus fast path exists on this firmware; the symbol in `libatspi` walks client-side and just compresses the result. The walk is heavily I/O-bound, so latency wins come from **pipelined concurrent fetches over a single async `zbus` connection** (the daemon is already `tokio` based) plus pruning non-`showing` subtrees and per-app coarse caching. After actions, the daemon waits for the `window:post-render` event so the returned snapshot reflects the post-action state. Concrete latency budgets are deferred until measured on target.
 3. **On-device footprint.** One static-ish multicall binary (CLI and daemon modes in the same executable, dispatched in `main()` on argv[1]). No dependency on `libatspi`, `libdbus-glib`, `libglib`/`libgio`. Direct D-Bus via `zbus`. Target size: ~1.5-2 MB total.
 4. **Zero on-target prerequisites beyond what the TV already has.** AT-SPI registry/bus, `libefl-util` for key injection (per Aurum's working path), `libecore-wl2` for display geometry. No new system service to install, no GMainLoop thread to babysit.
 
@@ -33,8 +33,10 @@ A few concrete rules that follow from the meta-objectives, applied throughout th
 - **Single in-flight request**: the daemon serializes commands behind one mutex. No request-queue depth to bound, no concurrent state machine.
 - **Postcard wire format** on the socket — compact, allocation-light, no JSON encode/decode on the hot path (JSON renders only at the CLI's text boundary).
 - **Direct `zbus`, no GLib/GIO/libatspi.** Daemon stays a single static-ish binary, no GMainLoop thread.
-- **`atspi_accessible_dump_tree` fast path**: one D-Bus round trip per snapshot, LZ4 + base64 payload, never a node-by-node walk.
-- **No persistent caches** except the focus-graph, which is bounded by screen signature and dropped on window change.
+- **Pipelined async walk** over a single `zbus` connection: `GetChildren`/`GetRoleName`/`Name`/`GetState` for siblings fire concurrently rather than serially. Confirmed on target that `DumpTree` as a D-Bus method does not exist on this Tizen 10 firmware; the walk is the only universal path.
+- **Subtree pruning**: don't recurse into nodes whose state lacks `SHOWING`. Off-screen rows in long lists are skipped, not walked.
+- **No persistent caches** except the focus-graph (bounded by screen signature, dropped on window change). `Cache.GetItems` returns empty on Tizen, so we don't try it.
+- **`Collection.GetMatches` is not relied on.** Inconsistent server-side validation across apps on Tizen 10 (Elementary apps reject most rules; Dali's homescreen rejects on tuple unmarshal). We use it only opportunistically, falling back to the walk on any rejection.
 - **No async runtime in the CLI**: blocking unix-socket I/O only; `tokio` is daemon-side.
 
 ## Architecture
@@ -121,14 +123,21 @@ The CLI and daemon share crate code but mode-specific paths are gated so the CLI
 
 ## Talking to AT-SPI
 
-We talk to AT-SPI as a pure D-Bus client via `zbus`. No `libatspi` on disk, no `libdbus-glib`, no GLib/GIO. The end-to-end path was proven in a prior PoC against the live target:
+We talk to AT-SPI as a pure D-Bus client via `zbus`. No `libatspi` on disk, no `libdbus-glib`, no GLib/GIO. End-to-end path validated against the live target (Tizen 10, armv7l):
 
-- AT-SPI bus is a regular unix socket at `/run/user/<uid>/at-spi/bus`.
-- Standard `org.a11y.atspi.*` interfaces are introspectable and callable over plain D-Bus.
-- Samsung's Tizen extensions (`DumpTree`, `GetNodeInfo`, `GetStringProperty`, `GetNeighbor`, `SetIncludeHidden`, `SetListenPostRender`, `DoGesture`) are exposed as plain D-Bus methods on the standard `org.a11y.atspi.Accessible` interface — Aurum's code at the C-API level confirms there is no hidden Samsung-only D-Bus interface.
-- `IsEnabled` on the **session bus** is toggled by plain `Properties.Set` on `org.a11y.Bus`. Aurum's reference uses GDBus over the session bus for the exact same property write, so there is no `kdbus` requirement and no need for a `libdbus-1` dependency for this one call.
+- AT-SPI bus is a regular unix-socket dbus-daemon at `/run/user/<uid>/at-spi/bus` (uid 5001 = `owner` on this firmware).
+- Standard `org.a11y.atspi.*` interfaces (`Accessible`, `Collection`, `Component`, `Cache`, etc.) are introspectable and callable.
+- Per-element walk works: `GetChildren` → `(sender, object_path)[]`, `GetRoleName` → `s`, `Name` property → `s`, `GetState` → `au` (two-word bitmask).
+- `IsEnabled` lives on the **session bus**, which on Tizen 10 is **kdbus** — `zbus` cannot speak kdbus. The daemon shells out a single `dbus-send --session ... org.freedesktop.DBus.Properties.Set ...` at startup. One-off, ~10 ms, no in-process kdbus dep.
+- **App discovery requires `aurum-bootstrap`** (`/usr/apps/org.tizen.aurum-bootstrap/`) to be running. Without it, only one or two Chromium-based apps appear on the registry. With it, 8-12 apps register (including Dali-Toolkit homescreen `home-mainhub` and Elementary windows like volume-app, voice-app, hbbtv-app). The bootstrap is a Samsung-supplied service that bridges non-libatspi-linked apps onto the bus; **we depend on it being installed on the TV image** for v0.1.
 
-The implementation revisits this only if a specific zbus call surprises us on target during 0.1 work. We are not currently planning a `libatspi` fallback path.
+### Things we found that aren't there
+
+Three claims from earlier drafts of this doc did not survive contact with the target:
+
+- **`DumpTree` as a D-Bus method.** Introspection on every registered app's `Accessible` interface shows no `DumpTree`. The string in `libatspi.so` belongs to `atspi_accessible_dump_tree`, a Samsung-patched C helper that walks the tree client-side and compresses the result with `lz4b64:`. There is no one-round-trip server fast path. Aurum's `UiObject::getDescendant()` (UiObject.cc:241-258) tries it first, then falls back to a `GetChildren` walk — the walk is the only universal path.
+- **`Cache.GetItems` as a flat-list shortcut.** Returns empty on this firmware. Not used.
+- **`Collection.GetMatches` as a primary path.** Server-side support is inconsistent across apps: most Elementary apps reject every rule with "Invalid match rule parameters"; Dali's homescreen rejects with a tuple-unmarshal mismatch on a signature that is bit-for-bit identical to the introspected one. Useful as an opportunistic narrowing call only.
 
 ## Key injection
 
@@ -278,7 +287,7 @@ The per-action auto-snapshot makes batching less critical than in `agent-browser
 |---|---|
 | 0.0 | Cargo-tizen project scaffold, armv7l release build, install to target via `rsdb`, smoke test. |
 | 0.1 | Daemon connects to AT-SPI bus via `zbus`, owns IsEnabled via plain session-bus property write, accepts unix socket, responds to `ping`. CLI auto-spawns daemon. |
-| 0.2 | `snap` returns compact text snapshot via `DumpTree` fast path + LZ4 + base64 decode. Per-snapshot `RefMap` (monotonic, cleared each snapshot). |
+| 0.2 | `snap` returns compact text snapshot via async pipelined walk (`GetChildren` + `GetRoleName` + `Name` + `GetState`, siblings fetched concurrently). Per-snapshot `RefMap` (monotonic, cleared each snapshot). Subtree pruning by `SHOWING` state. |
 | 0.3 | `click` ladder rungs 1-4 (direct AT-SPI action, `GrabHighlight`, `GrabFocus`). `key` raw injection via `libefl-util` (`efl_util_input_generate_key`). |
 | 0.4 | LRUD pathfinding (spatial greedy). Focus-graph BFS as fallback. `SetListenPostRender` + `window:post-render` wait around actions. |
 | 0.5 | `batch` mode, snapshot `--diff` (text diff against previous), `goto` verb. |
