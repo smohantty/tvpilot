@@ -2,7 +2,7 @@
 
 Wire protocol, request/response shapes, snapshot grammar, error catalog.
 
-This document is the contract between `tvpilot` (CLI) and `tvpilotd` (daemon). The CLI's argv parser translates user intent to `Request`. The daemon translates D-Bus reality back to `Response`. The agent never sees raw D-Bus or raw AT-SPI types.
+This document is the contract between the two modes of the `tvpilot` multicall binary: **CLI mode** (default invocation) and **daemon mode** (`tvpilot daemon`). The CLI's argv parser translates user intent to `Request`. The daemon translates D-Bus reality back to `Response`. The agent never sees raw D-Bus or raw AT-SPI types.
 
 ---
 

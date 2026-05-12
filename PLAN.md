@@ -21,10 +21,17 @@ In priority order:
 
 1. **Agent context size.** A snapshot the agent reads on every turn must be ~25× smaller than Aurum's `DumpObjectTree` output. We pay engineering cost upfront — strip non-actionable nodes, role-name dedup with `nth`, single-line elements, no doubled state encoding — so the agent pays fewer tokens forever.
 2. **Per-turn latency.** Use the `atspi_accessible_dump_tree` D-Bus fast path (one round trip, LZ4 + base64) instead of walking the tree node-by-node. Target <50 ms for a typical snapshot, <30 ms for the common click path.
-3. **On-device footprint.** Single static-ish binary per side. No dependency on libatspi, libdbus-glib, libglib, libgio. Direct D-Bus via `zbus`. Daemon ~1-1.5 MB, CLI <300 KB.
+3. **On-device footprint.** One static-ish multicall binary (CLI and daemon modes in the same executable, dispatched in `main()` on argv[1]). No dependency on libatspi, libdbus-glib, libglib, libgio. Direct D-Bus via `zbus`. Target size: ~1.5-2 MB total.
 4. **Zero on-target prerequisites beyond the TV's existing D-Bus.** No new system service to install, no GMainLoop thread to babysit.
 
 ## Architecture
+
+A **single multicall binary** named `tvpilot` runs in two modes:
+
+- **CLI mode** (default, e.g. `tvpilot snap`, `tvpilot click e5`) — short-lived, one request per invocation.
+- **Daemon mode** (`tvpilot daemon`) — long-lived background process. Owns the AT-SPI bus, RefMap, focus-graph cache, and IsEnabled lifecycle.
+
+The first CLI invocation auto-spawns the daemon by re-execing `/proc/self/exe daemon` if the socket isn't live. Both modes share crate code; `main()` dispatches on argv. `daemon` is a regular public subcommand — listed in `tvpilot --help` so it's debuggable directly, even though agents typically rely on auto-spawn.
 
 ```
                  ┌──────────────────────────────────┐
@@ -33,45 +40,70 @@ In priority order:
                                   │ shell exec
                                   ▼
                  ┌──────────────────────────────────┐
-                 │ tvpilot (CLI)                    │
-                 │   single short-lived process     │
-                 │   per agent turn                 │
+                 │ tvpilot (single binary)          │
+                 │                                  │
+                 │  main() dispatches on argv[1]:   │
+                 │   ─ "daemon"   → daemon::run()   │
+                 │   ─ <command>  → cli::run()      │
+                 │                                  │
+                 │  CLI mode (foreground):          │
+                 │    short-lived per turn          │
+                 │    auto-spawns daemon by         │
+                 │    re-execing /proc/self/exe     │
+                 │    daemon if socket not live     │
+                 │                                  │
+                 │  Daemon mode (background):       │
+                 │    holds AT-SPI bus conn,        │
+                 │    RefMap, focus-graph cache,    │
+                 │    IsEnabled lifecycle           │
                  └──────────────────────────────────┘
                                   │ unix socket
-                                  │ length-prefixed postcard frames
+                                  │ framed messages
                                   ▼
-                 ┌──────────────────────────────────┐
-                 │ tvpilotd (daemon)                │
-                 │   ─ holds at-spi bus connection  │
-                 │   ─ holds RefMap session state   │
-                 │   ─ holds focus-graph cache      │
-                 │   ─ owns IsEnabled lifecycle     │
-                 └──────────────────────────────────┘
-                                  │
                        ┌──────────┼──────────┐
                        ▼          ▼          ▼
-                   AT-SPI bus  session  Wayland /
-                   (unix sock) bus      uinput
+                   AT-SPI bus  session  efl_util /
+                   (unix sock) bus      input gen
                                         (for key inject)
 ```
 
 ### Components
 
-- **`tvpilot`** — CLI, statically linked, no async runtime. Parses argv, connects to the daemon socket, sends one request, prints one response, exits. If the socket isn't there, spawns the daemon and retries with backoff. Returns the daemon's response verbatim (the daemon does all formatting work).
-- **`tvpilotd`** — daemon, async (tokio current-thread). Owns the AT-SPI D-Bus connection, the per-session RefMap, the focus-graph cache, and the IsEnabled lifecycle. Listens on a single unix socket. Exits N seconds after the last CLI disconnects.
+One binary, two entry points:
+
+- **CLI mode** — parses argv, connects to the daemon socket, sends one framed request, prints one response, exits. If the socket isn't live, re-execs `/proc/self/exe daemon` detached, polls the socket with backoff, then retries the request. No async runtime in this path.
+- **Daemon mode** — async (tokio current-thread). Owns the AT-SPI D-Bus connection, the per-session RefMap, the focus-graph cache, and the IsEnabled lifecycle. Listens on a single unix socket. Exits N seconds after the last CLI disconnects.
+
+`main()` is a thin dispatcher:
+
+```rust
+fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    match args.next().as_deref().and_then(|s| s.to_str()) {
+        Some("daemon") => daemon::run(args),
+        _ => cli::run(std::env::args_os().skip(1)),
+    }
+}
+```
+
+Daemon-only heavy deps (zbus, AT-SPI bindings) are kept out of the CLI hot path via lazy-init or feature gating where cold-start latency matters. The argv[0] symlink trick (busybox-style) is **not** used — a plain subcommand is simpler to install, simpler to debug (`tvpilot daemon` runs the daemon directly with no socket plumbing), and avoids env-var inheritance footguns when the daemon shells out to other processes.
+
+A single session is assumed (one TV, one foreground app at a time) — no equivalent of agent-browser's `AGENT_BROWSER_SESSION` env var. The socket path is fixed; concurrent daemons are neither needed nor supported.
 
 ### Lifecycle
 
 | Trigger | Behavior |
 |---|---|
-| First `tvpilot` invocation | CLI connects to socket → fails → spawns `tvpilotd` as detached child → polls socket up to 2 s with backoff → connects → sends request |
+| First `tvpilot` invocation | CLI connects to socket → fails → re-execs `/proc/self/exe daemon` as detached child → polls socket up to 2 s with backoff → connects → sends request |
 | Subsequent invocations | CLI connects immediately, sends request, exits |
-| Daemon startup | Sets `org.a11y.Status.IsEnabled = true` on the session bus, holds the proxy alive |
-| `tvpilot close` (or daemon idle timeout) | Daemon sets `IsEnabled = false`, releases bus connection, removes socket, exits |
-| Daemon crash | Next CLI invocation re-spawns it; CLI gets a one-time `daemon_restarted=true` in the response so the agent knows refs are gone |
+| Daemon startup | Writes `tvpilot.pid` and `tvpilot.version` sidecars next to the socket. Sets `org.a11y.Status.IsEnabled = true` on the session bus, holds the proxy alive |
+| `tvpilot close` happy path | CLI sends `Close` over the socket. Daemon sets `IsEnabled = false`, releases bus connection, removes socket + sidecars, exits |
+| `tvpilot close` unreachable-daemon fallback | If the daemon doesn't respond within ~500 ms but the pid in `tvpilot.pid` is alive, CLI sends `SIGKILL` to the pid then removes stale `tvpilot.sock` / `tvpilot.pid` / `tvpilot.version`. Lifted from agent-browser's `run_close_all` |
+| Daemon crash | Next CLI invocation finds stale socket → checks `tvpilot.pid` → if dead, cleans sidecars and re-execs daemon. Response carries `daemon_restarted=true` so the agent knows refs are gone |
+| Version skew (CLI vs running daemon) | CLI reads `tvpilot.version` before connecting. On mismatch, sends `Close`, waits, then re-execs the matching daemon |
 | Concurrent CLI access | Daemon accepts only one connection at a time; second connection gets `BUSY` and is told to retry |
 
-The CLI does not link the daemon code — they are separate binaries. CLI is intentionally minimal so its startup cost is dominated by `exec()` and dynamic linking, not crate init.
+The CLI and daemon share crate code but mode-specific paths are gated so the CLI's cold-start cost stays dominated by `exec()` and dynamic linking, not by daemon-side crate init.
 
 ## Direct D-Bus, no libatspi
 
