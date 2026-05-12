@@ -1,13 +1,12 @@
 //! Daemon mode: bind a unix socket and serve framed Snap requests.
 
-use anyhow::{Context, Result};
-use std::path::PathBuf;
+use anyhow::{Context, Result, anyhow, bail};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
-use crate::proto::{Command, Payload, Request, Response, SnapResult, Timing};
+use crate::proto::{Command, Payload, Request, Response, SnapResult, Timing, socket_path};
 
 mod atspi;
 mod input;
@@ -24,22 +23,17 @@ struct DaemonState {
     started: Instant,
 }
 
-pub fn socket_path() -> PathBuf {
-    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/5001".into());
-    PathBuf::from(format!("{}/tvpilot.sock", runtime))
-}
-
 pub async fn run() -> Result<()> {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
+    let listener =
+        UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
     eprintln!("[tvpilotd] listening on {}", sock.display());
 
     // Toggle a11y on at startup. Best-effort.
-    if let Err(e) = atspi::enable_a11y().await {
-        eprintln!("[tvpilotd] WARN enable_a11y: {:#}", e);
-    } else {
-        eprintln!("[tvpilotd] a11y enabled");
+    match atspi::enable_a11y().await {
+        Ok(()) => eprintln!("[tvpilotd] a11y enabled"),
+        Err(e) => eprintln!("[tvpilotd] WARN enable_a11y: {e:#}"),
     }
 
     // Hold a single warm AT-SPI connection for the daemon's lifetime.
@@ -54,7 +48,7 @@ pub async fn run() -> Result<()> {
             Some(Arc::new(k))
         }
         Err(e) => {
-            eprintln!("[tvpilotd] WARN no key injector: {:#}", e);
+            eprintln!("[tvpilotd] WARN no key injector: {e:#}");
             None
         }
     };
@@ -69,19 +63,15 @@ pub async fn run() -> Result<()> {
 
     loop {
         let (stream, _) = listener.accept().await.context("accept")?;
-        if let Err(e) = handle(stream, state.clone()).await {
-            eprintln!("[tvpilotd] connection error: {:#}", e);
+        if let Err(e) = handle(stream, Arc::clone(&state)).await {
+            eprintln!("[tvpilotd] connection error: {e:#}");
         }
     }
 }
 
 async fn handle(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
-    loop {
-        let req = match read_frame::<Request>(&mut stream).await {
-            Ok(r) => r,
-            Err(_) => return Ok(()), // peer closed
-        };
-        let resp = dispatch(req, state.clone()).await;
+    while let Ok(req) = read_frame::<Request>(&mut stream).await {
+        let resp = dispatch(req, &state).await;
         let close = matches!(&resp.payload, Payload::Closed);
         write_frame(&mut stream, &resp).await?;
         if close {
@@ -90,9 +80,10 @@ async fn handle(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
             std::process::exit(0);
         }
     }
+    Ok(())
 }
 
-async fn dispatch(req: Request, state: Arc<DaemonState>) -> Response {
+async fn dispatch(req: Request, state: &DaemonState) -> Response {
     let t0 = Instant::now();
     let rid = req.rid;
     let mut timing = Timing::default();
@@ -103,38 +94,39 @@ async fn dispatch(req: Request, state: Arc<DaemonState>) -> Response {
         },
         Command::Close => Payload::Closed,
         Command::Snap { interactive, verbose } => {
-            match do_snap(&state, interactive, verbose, &mut timing).await {
-                Ok(r) => Payload::Snap(r),
-                Err(e) => Payload::Error(format!("{:#}", e)),
-            }
+            into_payload(do_snap(state, interactive, verbose, &mut timing).await, Payload::Snap)
         }
-        Command::Key { name, count } => match do_key(&state, &name, count) {
-            Ok(c) => Payload::KeySent { count: c },
-            Err(e) => Payload::Error(format!("{:#}", e)),
-        },
-        Command::Click { ref_id, interactive, verbose } => {
-            match do_click(&state, &ref_id, interactive, verbose, &mut timing).await {
-                Ok(r) => Payload::Snap(r),
-                Err(e) => Payload::Error(format!("{:#}", e)),
-            }
+        Command::Key { name, count } => {
+            into_payload(do_key(state, &name, count), |c| Payload::KeySent { count: c })
         }
+        Command::Click { ref_id, interactive, verbose } => into_payload(
+            do_click(state, &ref_id, interactive, verbose, &mut timing).await,
+            Payload::Snap,
+        ),
     };
     timing.total_ms = t0.elapsed().as_millis() as u32;
     Response { rid, payload, timing }
 }
 
-fn do_key(state: &Arc<DaemonState>, name: &str, count: u32) -> Result<u32> {
+fn into_payload<T>(r: Result<T>, ok: impl FnOnce(T) -> Payload) -> Payload {
+    match r {
+        Ok(v) => ok(v),
+        Err(e) => Payload::Error(format!("{e:#}")),
+    }
+}
+
+fn do_key(state: &DaemonState, name: &str, count: u32) -> Result<u32> {
     let inj = state
         .keys
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no key injector — daemon failed to init efl_util"))?;
+        .ok_or_else(|| anyhow!("no key injector — daemon failed to init efl_util"))?;
     let key = resolve_key_name(name)?;
     inj.send_key(key, count)?;
     Ok(count.max(1))
 }
 
 async fn do_click(
-    state: &Arc<DaemonState>,
+    state: &DaemonState,
     ref_id: &str,
     interactive: bool,
     verbose: bool,
@@ -142,83 +134,23 @@ async fn do_click(
 ) -> Result<SnapResult> {
     // Resolve `eN` → RefEntry from the most recent snapshot's RefMap.
     let target = {
-        let map = state.refmap.lock().unwrap();
+        let map = state.refmap.lock().expect("refmap poisoned");
         let idx = parse_ref_id(ref_id)
-            .ok_or_else(|| anyhow::anyhow!("malformed ref '{}': expected eN", ref_id))?;
+            .ok_or_else(|| anyhow!("malformed ref '{ref_id}': expected eN"))?;
         if idx == 0 || idx > map.len() {
-            return Err(anyhow::anyhow!(
-                "RefUnknown: '{}' not in current snapshot (snapshot has {} refs)",
-                ref_id,
-                map.len()
-            ));
+            bail!(
+                "RefUnknown: '{ref_id}' not in current snapshot (snapshot has {} refs)",
+                map.len(),
+            );
         }
         map[idx - 1].clone()
     };
-    eprintln!(
-        "[tvpilotd] click {} → {} {}",
-        ref_id, target.sender, target.path
-    );
+    eprintln!("[tvpilotd] click {ref_id} → {} {}", target.sender, target.path);
 
-    // Click ladder. Best-effort, fall through to the next rung on any failure.
-    let mut path_used = "unknown".to_string();
-
-    // Rung 1: already focused/highlighted? → send Enter.
-    if let Ok(s) = atspi::get_state(&state.atspi, &target.sender, &target.path).await {
-        if s.focused() {
-            if let Some(inj) = state.keys.as_ref() {
-                inj.send_key("Return", 1).ok();
-                path_used = "focused+Enter".to_string();
-            }
-        }
-    }
-
-    // Rung 2: direct Action.click / Action.activate.
-    if path_used == "unknown" {
-        if let Some(idx) =
-            atspi::find_action(&state.atspi, &target.sender, &target.path).await
-        {
-            match atspi::do_action(&state.atspi, &target.sender, &target.path, idx).await {
-                Ok(true) => path_used = format!("DoAction({})", idx),
-                Ok(false) => eprintln!("[tvpilotd] DoAction({}) returned false", idx),
-                Err(e) => eprintln!("[tvpilotd] DoAction failed: {:#}", e),
-            }
-        }
-    }
-
-    // Rung 3: GrabHighlight, then Enter.
-    if path_used == "unknown" {
-        match atspi::grab_highlight(&state.atspi, &target.sender, &target.path).await {
-            Ok(true) => {
-                if let Some(inj) = state.keys.as_ref() {
-                    inj.send_key("Return", 1).ok();
-                }
-                path_used = "GrabHighlight+Enter".to_string();
-            }
-            _ => {}
-        }
-    }
-
-    // Rung 4: GrabFocus, then Enter.
-    if path_used == "unknown" {
-        match atspi::grab_focus(&state.atspi, &target.sender, &target.path).await {
-            Ok(true) => {
-                if let Some(inj) = state.keys.as_ref() {
-                    inj.send_key("Return", 1).ok();
-                }
-                path_used = "GrabFocus+Enter".to_string();
-            }
-            _ => {}
-        }
-    }
-
-    if path_used == "unknown" {
-        return Err(anyhow::anyhow!(
-            "all click ladder rungs failed for {} ({})",
-            ref_id,
-            target.role
-        ));
-    }
-    eprintln!("[tvpilotd] click path: {}", path_used);
+    let path_used = click_ladder(state, &target).await.ok_or_else(|| {
+        anyhow!("all click ladder rungs failed for {ref_id} ({})", target.role)
+    })?;
+    eprintln!("[tvpilotd] click path: {path_used}");
 
     // Give the UI a beat to settle. PLAN.md calls for waiting on
     // window:post-render; we'll get there once we wire up event subscription.
@@ -227,17 +159,56 @@ async fn do_click(
     do_snap(state, interactive, verbose, timing).await
 }
 
+/// Try each rung of the click ladder. Returns the name of the rung that
+/// succeeded, or `None` if every rung failed.
+async fn click_ladder(state: &DaemonState, target: &RefEntry) -> Option<String> {
+    // Rung 1: already focused → send Enter.
+    if let Ok(s) = atspi::get_state(&state.atspi, &target.sender, &target.path).await
+        && s.focused()
+        && let Some(inj) = state.keys.as_ref()
+    {
+        inj.send_key("Return", 1).ok();
+        return Some("focused+Enter".into());
+    }
+
+    // Rung 2: direct Action.click / Action.activate.
+    if let Some(idx) = atspi::find_action(&state.atspi, &target.sender, &target.path).await {
+        match atspi::do_action(&state.atspi, &target.sender, &target.path, idx).await {
+            Ok(true) => return Some(format!("DoAction({idx})")),
+            Ok(false) => eprintln!("[tvpilotd] DoAction({idx}) returned false"),
+            Err(e) => eprintln!("[tvpilotd] DoAction failed: {e:#}"),
+        }
+    }
+
+    // Rung 3: GrabHighlight, then Enter.
+    if let Ok(true) = atspi::grab_highlight(&state.atspi, &target.sender, &target.path).await {
+        if let Some(inj) = state.keys.as_ref() {
+            inj.send_key("Return", 1).ok();
+        }
+        return Some("GrabHighlight+Enter".into());
+    }
+
+    // Rung 4: GrabFocus, then Enter.
+    if let Ok(true) = atspi::grab_focus(&state.atspi, &target.sender, &target.path).await {
+        if let Some(inj) = state.keys.as_ref() {
+            inj.send_key("Return", 1).ok();
+        }
+        return Some("GrabFocus+Enter".into());
+    }
+
+    None
+}
+
 fn parse_ref_id(s: &str) -> Option<usize> {
     let trimmed = s
         .strip_prefix("ref=")
         .or_else(|| s.strip_prefix('@'))
         .unwrap_or(s);
-    let n = trimmed.strip_prefix('e')?;
-    n.parse::<usize>().ok()
+    trimmed.strip_prefix('e')?.parse().ok()
 }
 
 async fn do_snap(
-    state: &Arc<DaemonState>,
+    state: &DaemonState,
     interactive: bool,
     verbose: bool,
     timing: &mut Timing,
@@ -259,27 +230,15 @@ async fn do_snap(
             vec![a.clone()]
         }
         None => {
-            eprintln!(
-                "[tvpilotd] no STATE_ACTIVE found; walking all {} apps",
-                apps.len()
-            );
+            eprintln!("[tvpilotd] no STATE_ACTIVE found; walking all {} apps", apps.len());
             apps.clone()
         }
     };
 
     let t = Instant::now();
-    let walks: Vec<_> = targets
-        .iter()
-        .map(|(s, p)| {
-            atspi::walk(
-                atspi.clone(),
-                s.clone(),
-                p.clone(),
-                interactive,
-                verbose,
-            )
-        })
-        .collect();
+    let walks = targets.iter().map(|(s, p)| {
+        atspi::walk(Arc::clone(atspi), s.clone(), p.clone(), interactive, verbose)
+    });
     let results = futures::future::join_all(walks).await;
     timing.walk_ms = t.elapsed().as_millis() as u32;
 
@@ -298,18 +257,18 @@ async fn do_snap(
             chosen_nodes = *c;
         }
         if !r.is_empty() {
-            rendered.push_str(&format!("# app={}\n", sender));
+            rendered.push_str(&format!("# app={sender}\n"));
             rendered.push_str(r);
         }
         combined_refmap.extend(rm.iter().cloned());
     }
 
     // Publish the RefMap so subsequent `click`/`focus` can resolve refs.
-    *state.refmap.lock().unwrap() = combined_refmap;
+    *state.refmap.lock().expect("refmap poisoned") = combined_refmap;
 
     Ok(SnapResult {
         app_bus: if chosen_bus.is_empty() {
-            "<none>".to_string()
+            "<none>".into()
         } else {
             chosen_bus
         },
@@ -323,7 +282,7 @@ async fn read_frame<T: for<'de> serde::Deserialize<'de>>(s: &mut UnixStream) -> 
     s.read_exact(&mut len_buf).await.context("read length")?;
     let len = u32::from_le_bytes(len_buf) as usize;
     if len > 16 * 1024 * 1024 {
-        anyhow::bail!("frame too big: {} bytes", len);
+        bail!("frame too big: {len} bytes");
     }
     let mut buf = vec![0u8; len];
     s.read_exact(&mut buf).await.context("read body")?;

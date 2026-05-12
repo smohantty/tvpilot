@@ -82,6 +82,8 @@ fn role_tier(role: &str) -> Tier {
 }
 
 const ATSPI_ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
+const ATSPI_ACTION: &str = "org.a11y.atspi.Action";
+const ATSPI_COMPONENT: &str = "org.a11y.atspi.Component";
 const ATSPI_PROPS: &str = "org.freedesktop.DBus.Properties";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -100,43 +102,55 @@ const STATE_HIGHLIGHTABLE: u32 = 41;
 pub struct StateBits {
     raw: [u32; 2],
 }
+
 impl StateBits {
     fn from_vec(v: Vec<u32>) -> Self {
-        let raw = match v.len() {
-            0 => [0, 0],
-            1 => [v[0], 0],
-            _ => [v[0], v[1]],
-        };
+        let mut raw = [0u32; 2];
+        for (slot, bits) in raw.iter_mut().zip(v) {
+            *slot = bits;
+        }
         Self { raw }
     }
+
     fn has(&self, idx: u32) -> bool {
-        if idx < 32 {
-            (self.raw[0] >> idx) & 1 == 1
-        } else if idx < 64 {
-            (self.raw[1] >> (idx - 32)) & 1 == 1
-        } else {
-            false
+        match idx {
+            0..32 => (self.raw[0] >> idx) & 1 == 1,
+            32..64 => (self.raw[1] >> (idx - 32)) & 1 == 1,
+            _ => false,
         }
     }
+
     pub fn active(&self) -> bool { self.has(STATE_ACTIVE) }
     pub fn focused(&self) -> bool { self.has(STATE_FOCUSED) }
     pub fn showing(&self) -> bool { self.has(STATE_SHOWING) }
+
     pub fn is_interactive(&self) -> bool {
         (self.has(STATE_SENSITIVE) || self.has(STATE_FOCUSABLE) || self.has(STATE_HIGHLIGHTABLE))
             && self.has(STATE_VISIBLE)
             && self.has(STATE_SHOWING)
     }
+
     pub fn short_flags(&self) -> String {
         let mut s = String::new();
-        if self.has(STATE_FOCUSABLE)     { s.push('f'); }
-        if self.has(STATE_FOCUSED)       { s.push('F'); }
-        if self.has(STATE_SENSITIVE)     { s.push('s'); }
-        if self.has(STATE_VISIBLE)       { s.push('v'); }
-        if self.has(STATE_SHOWING)       { s.push('S'); }
-        if self.has(STATE_HIGHLIGHTABLE) { s.push('h'); }
-        if self.has(STATE_HIGHLIGHTED)   { s.push('H'); }
+        for (bit, ch) in [
+            (STATE_FOCUSABLE, 'f'),
+            (STATE_FOCUSED, 'F'),
+            (STATE_SENSITIVE, 's'),
+            (STATE_VISIBLE, 'v'),
+            (STATE_SHOWING, 'S'),
+            (STATE_HIGHLIGHTABLE, 'h'),
+            (STATE_HIGHLIGHTED, 'H'),
+        ] {
+            if self.has(bit) {
+                s.push(ch);
+            }
+        }
         s
     }
+}
+
+fn proxy<'a>(conn: &Arc<SyncConnection>, sender: &str, path: &str) -> Proxy<'a, Arc<SyncConnection>> {
+    Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone())
 }
 
 /// Connect to the AT-SPI bus (plain unix socket on Tizen).
@@ -148,7 +162,7 @@ pub async fn connect_atspi() -> Result<Arc<SyncConnection>> {
         .context("dbus_tokio from_channel")?;
     tokio::spawn(async move {
         let err = resource.await;
-        eprintln!("[tvpilotd] at-spi resource ended: {}", err);
+        eprintln!("[tvpilotd] at-spi resource ended: {err}");
     });
     Ok(conn)
 }
@@ -162,11 +176,10 @@ pub async fn enable_a11y() -> Result<()> {
         let _ = resource.await;
     });
     let bus = Proxy::new("org.a11y.Bus", "/org/a11y/bus", TIMEOUT, conn);
-    let v: Variant<bool> = Variant(true);
     bus.method_call::<(), _, _, _>(
         ATSPI_PROPS,
         "Set",
-        ("org.a11y.Status", "IsEnabled", v),
+        ("org.a11y.Status", "IsEnabled", Variant(true)),
     )
     .await
     .context("Properties.Set IsEnabled")?;
@@ -175,12 +188,7 @@ pub async fn enable_a11y() -> Result<()> {
 
 /// List every app registered on the AT-SPI bus.
 pub async fn list_apps(conn: &Arc<SyncConnection>) -> Result<Vec<(String, String)>> {
-    let proxy = Proxy::new(
-        "org.a11y.atspi.Registry",
-        "/org/a11y/atspi/accessible/root",
-        TIMEOUT,
-        conn.clone(),
-    );
+    let proxy = proxy(conn, "org.a11y.atspi.Registry", "/org/a11y/atspi/accessible/root");
     let (children,): (Vec<(String, dbus::Path<'static>)>,) = proxy
         .method_call(ATSPI_ACCESSIBLE, "GetChildren", ())
         .await
@@ -198,24 +206,15 @@ pub async fn find_active_app(
     apps: &[(String, String)],
 ) -> Option<(String, String)> {
     let probes = apps.iter().map(|(s, p)| {
-        let c = conn.clone();
-        let s = s.clone();
-        let p = p.clone();
+        let (s, p, conn) = (s.clone(), p.clone(), conn.clone());
         async move {
-            let pr = Proxy::new(s.clone(), p.clone(), TIMEOUT, c);
-            let (state,): (Vec<u32>,) = pr
-                .method_call(ATSPI_ACCESSIBLE, "GetState", ())
-                .await
-                .ok()?;
-            if StateBits::from_vec(state).active() {
-                Some((s, p))
-            } else {
-                None
-            }
+            let pr = proxy(&conn, &s, &p);
+            let (state,): (Vec<u32>,) =
+                pr.method_call(ATSPI_ACCESSIBLE, "GetState", ()).await.ok()?;
+            StateBits::from_vec(state).active().then_some((s, p))
         }
     });
-    let results = futures::future::join_all(probes).await;
-    results.into_iter().flatten().next()
+    futures::future::join_all(probes).await.into_iter().flatten().next()
 }
 
 /// Intermediate tree built from the concurrent walk. Refs are NOT yet
@@ -248,8 +247,7 @@ pub async fn get_state(
     sender: &str,
     path: &str,
 ) -> Result<StateBits> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (v,): (Vec<u32>,) = proxy
+    let (v,): (Vec<u32>,) = proxy(conn, sender, path)
         .method_call(ATSPI_ACCESSIBLE, "GetState", ())
         .await
         .context("GetState")?;
@@ -263,19 +261,15 @@ pub async fn find_action(
     sender: &str,
     path: &str,
 ) -> Option<i32> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
     // GetActions returns a(sss) — array of (name, description, key_binding).
-    let (actions,): (Vec<(String, String, String)>,) = proxy
-        .method_call("org.a11y.atspi.Action", "GetActions", ())
+    let (actions,): (Vec<(String, String, String)>,) = proxy(conn, sender, path)
+        .method_call(ATSPI_ACTION, "GetActions", ())
         .await
         .ok()?;
-    for (i, (name, _, _)) in actions.iter().enumerate() {
-        let n = name.to_ascii_lowercase();
-        if n == "click" || n == "activate" || n == "default" {
-            return Some(i as i32);
-        }
-    }
-    None
+    actions.iter().enumerate().find_map(|(i, (name, _, _))| {
+        matches!(name.to_ascii_lowercase().as_str(), "click" | "activate" | "default")
+            .then_some(i as i32)
+    })
 }
 
 /// Invoke `Action.DoAction(idx)` on the element.
@@ -285,9 +279,8 @@ pub async fn do_action(
     path: &str,
     idx: i32,
 ) -> Result<bool> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (ok,): (bool,) = proxy
-        .method_call("org.a11y.atspi.Action", "DoAction", (idx,))
+    let (ok,): (bool,) = proxy(conn, sender, path)
+        .method_call(ATSPI_ACTION, "DoAction", (idx,))
         .await
         .context("DoAction")?;
     Ok(ok)
@@ -299,9 +292,8 @@ pub async fn grab_highlight(
     sender: &str,
     path: &str,
 ) -> Result<bool> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (ok,): (bool,) = proxy
-        .method_call("org.a11y.atspi.Component", "GrabHighlight", ())
+    let (ok,): (bool,) = proxy(conn, sender, path)
+        .method_call(ATSPI_COMPONENT, "GrabHighlight", ())
         .await
         .context("GrabHighlight")?;
     Ok(ok)
@@ -313,9 +305,8 @@ pub async fn grab_focus(
     sender: &str,
     path: &str,
 ) -> Result<bool> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (ok,): (bool,) = proxy
-        .method_call("org.a11y.atspi.Component", "GrabFocus", ())
+    let (ok,): (bool,) = proxy(conn, sender, path)
+        .method_call(ATSPI_COMPONENT, "GrabFocus", ())
         .await
         .context("GrabFocus")?;
     Ok(ok)
@@ -331,7 +322,7 @@ pub async fn walk(
     verbose: bool,
 ) -> (String, u32, Vec<RefEntry>) {
     let root = build_tree(conn, sender, path).await;
-    let mut refmap: Vec<RefEntry> = Vec::new();
+    let mut refmap = Vec::new();
     let mut out = String::new();
     let mut total: u32 = 0;
     render(&root, 0, &mut refmap, &mut out, &mut total, interactive_only, verbose);
@@ -344,23 +335,23 @@ fn build_tree(
     path: String,
 ) -> BoxFuture<'static, Node> {
     async move {
-        let proxy = Proxy::new(sender.clone(), path.clone(), TIMEOUT, conn.clone());
+        let pr = proxy(&conn, &sender, &path);
 
-        let role_f = proxy.method_call::<(String,), _, _, _>(ATSPI_ACCESSIBLE, "GetRoleName", ());
-        let name_f = proxy.method_call::<(Variant<String>,), _, _, _>(
+        let role_f = pr.method_call::<(String,), _, _, _>(ATSPI_ACCESSIBLE, "GetRoleName", ());
+        let name_f = pr.method_call::<(Variant<String>,), _, _, _>(
             ATSPI_PROPS,
             "Get",
             (ATSPI_ACCESSIBLE, "Name"),
         );
-        let state_f = proxy.method_call::<(Vec<u32>,), _, _, _>(ATSPI_ACCESSIBLE, "GetState", ());
-        let children_f = proxy.method_call::<(Vec<(String, dbus::Path<'static>)>,), _, _, _>(
+        let state_f = pr.method_call::<(Vec<u32>,), _, _, _>(ATSPI_ACCESSIBLE, "GetState", ());
+        let children_f = pr.method_call::<(Vec<(String, dbus::Path<'static>)>,), _, _, _>(
             ATSPI_ACCESSIBLE,
             "GetChildren",
             (),
         );
 
         let (role, name, state, children) = tokio::join!(role_f, name_f, state_f, children_f);
-        let role = role.map(|(s,)| s).unwrap_or_else(|_| "?".to_string());
+        let role = role.map(|(s,)| s).unwrap_or_else(|_| "?".into());
         let name = name.map(|(Variant(s),)| s).unwrap_or_default();
         let state = StateBits::from_vec(state.map(|(v,)| v).unwrap_or_default());
         let children_pairs = children.map(|(v,)| v).unwrap_or_default();
@@ -377,10 +368,9 @@ fn build_tree(
             };
         }
 
-        let child_futs: Vec<_> = children_pairs
+        let child_futs = children_pairs
             .into_iter()
-            .map(|(cs, cp)| build_tree(conn.clone(), cs, cp.to_string()))
-            .collect();
+            .map(|(cs, cp)| build_tree(conn.clone(), cs, cp.to_string()));
         let children = futures::future::join_all(child_futs).await;
 
         Node {
@@ -432,7 +422,7 @@ fn render(
 
     let next_indent = if surface {
         let ref_idx = refmap.len() + 1;
-        let ref_id = format!("e{}", ref_idx);
+        let ref_id = format!("e{ref_idx}");
         refmap.push(RefEntry {
             sender: node.sender.clone(),
             path: node.path.clone(),
@@ -445,28 +435,24 @@ fn render(
         let name_part = if node.name.is_empty() {
             String::new()
         } else {
-            format!(" \"{}\"{}", node.name, marker)
+            format!(" \"{}\"{marker}", node.name)
         };
         if verbose {
             // Diagnostic line: role + state flags surfaced.
-            let flags_part = format!(" [{}]", node.state.short_flags());
+            let flags = node.state.short_flags();
             out.push_str(&format!(
-                "{}- {}{}{} [ref={}]\n",
-                pad, node.role, name_part, flags_part, ref_id
+                "{pad}- {}{name_part} [{flags}] [ref={ref_id}]\n",
+                node.role,
             ));
+        } else if node.name.is_empty() {
+            // No name: surface the role so the agent at least sees
+            // *something*. Rare given our ref-bearing rule.
+            out.push_str(&format!("{pad}- {} [ref={ref_id}]\n", node.role));
         } else {
-            // Default: minimal — name + focus marker + ref. Role string is
-            // omitted because on Tizen Dali widgets it is uniformly
-            // "unknown" and adds no decision signal for the agent. The
-            // role-tier classifier still runs invisibly to decide
-            // ref-bearing and interactivity.
-            if node.name.is_empty() {
-                // No name: surface the role so the agent at least sees
-                // *something*. This is rare given our ref-bearing rule.
-                out.push_str(&format!("{}- {} [ref={}]\n", pad, node.role, ref_id));
-            } else {
-                out.push_str(&format!("{}-{} [ref={}]\n", pad, name_part, ref_id));
-            }
+            // Default: minimal — name + focus marker + ref. Role is omitted
+            // because on Tizen Dali widgets it is uniformly "unknown" and
+            // adds no decision signal for the agent.
+            out.push_str(&format!("{pad}-{name_part} [ref={ref_id}]\n"));
         }
         *total += 1;
         indent + 1
@@ -476,14 +462,6 @@ fn render(
     };
 
     for child in &node.children {
-        render(
-            child,
-            next_indent,
-            refmap,
-            out,
-            total,
-            interactive_only,
-            verbose,
-        );
+        render(child, next_indent, refmap, out, total, interactive_only, verbose);
     }
 }

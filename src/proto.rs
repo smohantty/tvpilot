@@ -4,14 +4,15 @@
 //! A connection may carry many request/response pairs in order.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub rid: u32,
     pub cmd: Command,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Command {
     Ping,
     Snap {
@@ -64,4 +65,11 @@ pub struct Timing {
     pub total_ms: u32,
     pub detect_ms: u32,
     pub walk_ms: u32,
+}
+
+/// Path to the daemon's unix socket. Shared by CLI and daemon so they agree
+/// on where to meet.
+pub fn socket_path() -> PathBuf {
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/5001".into());
+    PathBuf::from(format!("{runtime}/tvpilot.sock"))
 }
