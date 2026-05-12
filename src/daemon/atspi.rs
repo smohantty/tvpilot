@@ -1,5 +1,6 @@
 //! AT-SPI client via the `dbus` crate. Async pipelined walk with concurrent
-//! per-node fetches.
+//! per-node fetches, then a single sequential render pass that assigns
+//! monotonic `eN` refs in tree-traversal order (per PLAN.md "Ref design").
 
 use anyhow::{Context, Result};
 use dbus::arg::Variant;
@@ -8,6 +9,77 @@ use dbus::nonblock::{Proxy, SyncConnection};
 use futures::future::{BoxFuture, FutureExt};
 use std::sync::Arc;
 use std::time::Duration;
+
+// ─── role tiers, per PLAN.md "Role classification" ──────────────────────────
+const INTERACTIVE_ROLES: &[&str] = &[
+    "push button",
+    "menu item",
+    "menu item radio",
+    "menu item check",
+    "check box",
+    "radio button",
+    "toggle button",
+    "slider",
+    "entry",
+    "combo box",
+    "list item",
+    "tab",
+    "tree item",
+    // Tizen / extra variants
+    "button",
+    "link",
+    "scroll bar",
+];
+
+const CONTENT_ROLES: &[&str] = &[
+    "heading",
+    "label",
+    "image",
+    "tooltip",
+    "table cell",
+    "column header",
+    "row header",
+    "static",
+    "text",
+];
+
+const STRUCTURAL_ROLES: &[&str] = &[
+    "filler",
+    "redundant object",
+    "panel",
+    "container",
+    "scroll pane",
+    "viewport",
+    "section",
+    "page tab list",
+    "window",
+    "application",
+    "frame",
+    "internal frame",
+    "layered pane",
+    "split pane",
+    "form",
+];
+
+#[derive(Copy, Clone, Debug)]
+enum Tier {
+    Interactive,
+    Content,
+    Structural,
+    Unknown,
+}
+
+fn role_tier(role: &str) -> Tier {
+    if INTERACTIVE_ROLES.contains(&role) {
+        Tier::Interactive
+    } else if CONTENT_ROLES.contains(&role) {
+        Tier::Content
+    } else if STRUCTURAL_ROLES.contains(&role) {
+        Tier::Structural
+    } else {
+        Tier::Unknown
+    }
+}
 
 const ATSPI_ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const ATSPI_PROPS: &str = "org.freedesktop.DBus.Properties";
@@ -146,36 +218,54 @@ pub async fn find_active_app(
     results.into_iter().flatten().next()
 }
 
-/// Recursive async walk. Per node we issue 4 D-Bus calls concurrently
-/// (`GetRoleName`, `Name` property, `GetState`, `GetChildren`), then recurse
-/// into all children concurrently. Subtrees lacking `SHOWING` are pruned.
-/// Returns (rendered tree text, node count).
+/// Intermediate tree built from the concurrent walk. Refs are NOT yet
+/// assigned — that happens deterministically in a sequential render pass so
+/// `eN` ids match tree-traversal order regardless of which `tokio::join!`
+/// future finished first.
+pub struct Node {
+    pub sender: String,
+    pub path: String,
+    pub role: String,
+    pub name: String,
+    pub state: StateBits,
+    pub children: Vec<Node>,
+}
+
+/// RefMap entry, populated during render. Carries enough to act on the
+/// element later (click ladder, etc.) — `(bus_name, object_path, role, name)`
+/// per PLAN.md "Ref design".
+#[derive(Clone)]
+pub struct RefEntry {
+    pub sender: String,
+    pub path: String,
+    pub role: String,
+    pub name: String,
+}
+
+/// Phase 1: concurrent walk → in-memory `Node` tree.
+/// Phase 2: sequential render with monotonic `eN` ref assignment.
 pub async fn walk(
     conn: Arc<SyncConnection>,
     sender: String,
     path: String,
     interactive_only: bool,
     verbose: bool,
-) -> (String, u32) {
-    let (out, count) = walk_node(conn, sender, path, 0, interactive_only, verbose).await;
-    (out, count)
+) -> (String, u32, Vec<RefEntry>) {
+    let root = build_tree(conn, sender, path).await;
+    let mut refmap: Vec<RefEntry> = Vec::new();
+    let mut out = String::new();
+    let mut total: u32 = 0;
+    render(&root, 0, &mut refmap, &mut out, &mut total, interactive_only, verbose);
+    (out, total, refmap)
 }
 
-fn walk_node(
+fn build_tree(
     conn: Arc<SyncConnection>,
     sender: String,
     path: String,
-    indent: usize,
-    interactive_only: bool,
-    verbose: bool,
-) -> BoxFuture<'static, (String, u32)> {
+) -> BoxFuture<'static, Node> {
     async move {
-        let proxy = Proxy::new(
-            sender.clone(),
-            path.clone(),
-            TIMEOUT,
-            conn.clone(),
-        );
+        let proxy = Proxy::new(sender.clone(), path.clone(), TIMEOUT, conn.clone());
 
         let role_f = proxy.method_call::<(String,), _, _, _>(ATSPI_ACCESSIBLE, "GetRoleName", ());
         let name_f = proxy.method_call::<(Variant<String>,), _, _, _>(
@@ -191,64 +281,118 @@ fn walk_node(
         );
 
         let (role, name, state, children) = tokio::join!(role_f, name_f, state_f, children_f);
-
         let role = role.map(|(s,)| s).unwrap_or_else(|_| "?".to_string());
         let name = name.map(|(Variant(s),)| s).unwrap_or_default();
         let state = StateBits::from_vec(state.map(|(v,)| v).unwrap_or_default());
-        let children = children.map(|(v,)| v).unwrap_or_default();
+        let children_pairs = children.map(|(v,)| v).unwrap_or_default();
 
-        // Visibility prune.
+        // Visibility prune at fetch time: skip walking !SHOWING subtrees.
         if !state.showing() {
-            return (String::new(), 0);
-        }
-
-        let mut out = String::new();
-        let mut count = 0;
-        let show = !interactive_only || state.is_interactive();
-        if show {
-            let pad = " ".repeat(indent * 2);
-            let marker = if state.focused() { "*" } else { "" };
-            let name_part = if name.is_empty() {
-                String::new()
-            } else {
-                format!(" \"{}\"", name)
+            return Node {
+                sender,
+                path,
+                role,
+                name,
+                state,
+                children: Vec::new(),
             };
-            if verbose {
-                out.push_str(&format!(
-                    "{}- {}{}{}  [{}]\n",
-                    pad,
-                    role,
-                    marker,
-                    name_part,
-                    state.short_flags()
-                ));
-            } else {
-                out.push_str(&format!("{}- {}{}{}\n", pad, role, marker, name_part));
-            }
-            count = 1;
         }
 
-        let next_indent = if show { indent + 1 } else { indent };
-        let child_futs: Vec<_> = children
+        let child_futs: Vec<_> = children_pairs
             .into_iter()
-            .map(|(cs, cp)| {
-                walk_node(
-                    conn.clone(),
-                    cs,
-                    cp.to_string(),
-                    next_indent,
-                    interactive_only,
-                    verbose,
-                )
-            })
+            .map(|(cs, cp)| build_tree(conn.clone(), cs, cp.to_string()))
             .collect();
-        let child_results = futures::future::join_all(child_futs).await;
-        for (c_out, c_count) in child_results {
-            out.push_str(&c_out);
-            count += c_count;
-        }
+        let children = futures::future::join_all(child_futs).await;
 
-        (out, count)
+        Node {
+            sender,
+            path,
+            role,
+            name,
+            state,
+            children,
+        }
     }
     .boxed()
+}
+
+/// Decide whether a node gets a ref. Per PLAN.md "Role classification":
+///   - Interactive role → always
+///   - Content role → iff name non-empty
+///   - Structural role → never (children float up at the same indent)
+///   - Unknown role (Tizen Dali widgets, etc.) → state-based promotion:
+///     ref if the node is interactive (sensitive/focusable/highlightable)
+///     or has a non-empty name (so labels still surface)
+fn ref_bearing(node: &Node) -> bool {
+    if !node.state.showing() {
+        return false;
+    }
+    match role_tier(&node.role) {
+        Tier::Interactive => true,
+        Tier::Content => !node.name.is_empty(),
+        Tier::Structural => false,
+        Tier::Unknown => node.state.is_interactive() || !node.name.is_empty(),
+    }
+}
+
+fn render(
+    node: &Node,
+    indent: usize,
+    refmap: &mut Vec<RefEntry>,
+    out: &mut String,
+    total: &mut u32,
+    interactive_only: bool,
+    verbose: bool,
+) {
+    if !node.state.showing() {
+        return;
+    }
+
+    let bears = ref_bearing(node);
+    let surface = bears && (!interactive_only || node.state.is_interactive());
+
+    let next_indent = if surface {
+        let ref_idx = refmap.len() + 1;
+        let ref_id = format!("e{}", ref_idx);
+        refmap.push(RefEntry {
+            sender: node.sender.clone(),
+            path: node.path.clone(),
+            role: node.role.clone(),
+            name: node.name.clone(),
+        });
+
+        let pad = " ".repeat(indent * 2);
+        let marker = if node.state.focused() { "*" } else { "" };
+        let name_part = if node.name.is_empty() {
+            String::new()
+        } else {
+            format!(" \"{}\"", node.name)
+        };
+        let flags_part = if verbose {
+            format!(" [{}]", node.state.short_flags())
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{}- {}{}{}{} [ref={}]\n",
+            pad, node.role, marker, name_part, flags_part, ref_id
+        ));
+        *total += 1;
+        indent + 1
+    } else {
+        // Structural or skipped: children float up at the same indent level.
+        indent
+    };
+
+    for child in &node.children {
+        render(
+            child,
+            next_indent,
+            refmap,
+            out,
+            total,
+            interactive_only,
+            verbose,
+        );
+    }
 }

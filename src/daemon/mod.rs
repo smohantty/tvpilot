@@ -142,12 +142,11 @@ async fn do_snap(
     let mut node_count = 0u32;
     let mut chosen_bus = String::new();
     let mut chosen_nodes = 0u32;
-    for ((sender, _), (r, c)) in targets.iter().zip(results.iter()) {
+    for ((sender, _), (r, c, _refmap)) in targets.iter().zip(results.iter()) {
         node_count += c;
         if *c == 0 {
             continue;
         }
-        // Prefer the app with the most nodes as the "primary".
         if *c > chosen_nodes {
             chosen_bus = sender.clone();
             chosen_nodes = *c;
