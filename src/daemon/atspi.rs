@@ -120,6 +120,7 @@ impl StateBits {
     }
     pub fn active(&self) -> bool { self.has(STATE_ACTIVE) }
     pub fn focused(&self) -> bool { self.has(STATE_FOCUSED) }
+    pub fn highlighted(&self) -> bool { self.has(STATE_HIGHLIGHTED) }
     pub fn showing(&self) -> bool { self.has(STATE_SHOWING) }
     pub fn is_interactive(&self) -> bool {
         (self.has(STATE_SENSITIVE) || self.has(STATE_FOCUSABLE) || self.has(STATE_HIGHLIGHTABLE))
@@ -227,6 +228,7 @@ pub struct Node {
     pub path: String,
     pub role: String,
     pub name: String,
+    pub description: String,
     pub state: StateBits,
     pub children: Vec<Node>,
 }
@@ -346,11 +348,19 @@ fn build_tree(
     async move {
         let proxy = Proxy::new(sender.clone(), path.clone(), TIMEOUT, conn.clone());
 
+        // 5 calls per node — all fan out concurrently. Description is often
+        // the user-visible label for Dali widgets where Name is an internal
+        // identifier; we surface whichever reads as more meaningful at render.
         let role_f = proxy.method_call::<(String,), _, _, _>(ATSPI_ACCESSIBLE, "GetRoleName", ());
         let name_f = proxy.method_call::<(Variant<String>,), _, _, _>(
             ATSPI_PROPS,
             "Get",
             (ATSPI_ACCESSIBLE, "Name"),
+        );
+        let desc_f = proxy.method_call::<(Variant<String>,), _, _, _>(
+            ATSPI_PROPS,
+            "Get",
+            (ATSPI_ACCESSIBLE, "Description"),
         );
         let state_f = proxy.method_call::<(Vec<u32>,), _, _, _>(ATSPI_ACCESSIBLE, "GetState", ());
         let children_f = proxy.method_call::<(Vec<(String, dbus::Path<'static>)>,), _, _, _>(
@@ -359,19 +369,21 @@ fn build_tree(
             (),
         );
 
-        let (role, name, state, children) = tokio::join!(role_f, name_f, state_f, children_f);
+        let (role, name, desc, state, children) =
+            tokio::join!(role_f, name_f, desc_f, state_f, children_f);
         let role = role.map(|(s,)| s).unwrap_or_else(|_| "?".to_string());
         let name = name.map(|(Variant(s),)| s).unwrap_or_default();
+        let description = desc.map(|(Variant(s),)| s).unwrap_or_default();
         let state = StateBits::from_vec(state.map(|(v,)| v).unwrap_or_default());
         let children_pairs = children.map(|(v,)| v).unwrap_or_default();
 
-        // Visibility prune at fetch time: skip walking !SHOWING subtrees.
         if !state.showing() {
             return Node {
                 sender,
                 path,
                 role,
                 name,
+                description,
                 state,
                 children: Vec::new(),
             };
@@ -388,6 +400,7 @@ fn build_tree(
             path,
             role,
             name,
+            description,
             state,
             children,
         }
@@ -406,11 +419,25 @@ fn ref_bearing(node: &Node) -> bool {
     if !node.state.showing() {
         return false;
     }
+    let has_label = !node.name.is_empty() || !node.description.is_empty();
     match role_tier(&node.role) {
         Tier::Interactive => true,
-        Tier::Content => !node.name.is_empty(),
+        Tier::Content => has_label,
         Tier::Structural => false,
-        Tier::Unknown => node.state.is_interactive() || !node.name.is_empty(),
+        Tier::Unknown => node.state.is_interactive() || has_label,
+    }
+}
+
+/// Pick the most human-readable label for this node. On Tizen Dali widgets,
+/// `Name` is usually an internal identifier ("d/ug.content.category@…");
+/// `Description` is often the user-visible label. We prefer Description when
+/// it's non-empty AND distinct from Name (some widgets duplicate them);
+/// otherwise fall back to Name.
+fn label_of(node: &Node) -> &str {
+    if !node.description.is_empty() && node.description != node.name {
+        node.description.as_str()
+    } else {
+        node.name.as_str()
     }
 }
 
@@ -433,45 +460,41 @@ fn render(
     let next_indent = if surface {
         let ref_idx = refmap.len() + 1;
         let ref_id = format!("e{}", ref_idx);
+        let label = label_of(node).to_string();
         refmap.push(RefEntry {
             sender: node.sender.clone(),
             path: node.path.clone(),
             role: node.role.clone(),
-            name: node.name.clone(),
+            name: label.clone(),
         });
 
         let pad = " ".repeat(indent * 2);
-        let marker = if node.state.focused() { "*" } else { "" };
-        let name_part = if node.name.is_empty() {
+        // On Tizen TVs the visible navigation cursor is STATE_HIGHLIGHTED
+        // (Samsung extension, bit 41 highlightable / bit 39 highlighted),
+        // NOT the standard ATSPI STATE_FOCUSED (which web-style widgets use).
+        // We mark on either so both worlds show up.
+        let focused_now = node.state.focused() || node.state.highlighted();
+        let marker = if focused_now { "*" } else { "" };
+        let label_part = if label.is_empty() {
             String::new()
         } else {
-            format!(" \"{}\"{}", node.name, marker)
+            format!(" \"{}\"{}", label, marker)
         };
         if verbose {
-            // Diagnostic line: role + state flags surfaced.
             let flags_part = format!(" [{}]", node.state.short_flags());
             out.push_str(&format!(
                 "{}- {}{}{} [ref={}]\n",
-                pad, node.role, name_part, flags_part, ref_id
+                pad, node.role, label_part, flags_part, ref_id
             ));
+        } else if label.is_empty() {
+            // No label at all: surface the role so the line says something.
+            out.push_str(&format!("{}- {}{} [ref={}]\n", pad, node.role, marker, ref_id));
         } else {
-            // Default: minimal — name + focus marker + ref. Role string is
-            // omitted because on Tizen Dali widgets it is uniformly
-            // "unknown" and adds no decision signal for the agent. The
-            // role-tier classifier still runs invisibly to decide
-            // ref-bearing and interactivity.
-            if node.name.is_empty() {
-                // No name: surface the role so the agent at least sees
-                // *something*. This is rare given our ref-bearing rule.
-                out.push_str(&format!("{}- {} [ref={}]\n", pad, node.role, ref_id));
-            } else {
-                out.push_str(&format!("{}-{} [ref={}]\n", pad, name_part, ref_id));
-            }
+            out.push_str(&format!("{}-{} [ref={}]\n", pad, label_part, ref_id));
         }
         *total += 1;
         indent + 1
     } else {
-        // Structural or skipped: children float up at the same indent level.
         indent
     };
 
