@@ -85,14 +85,11 @@ pub async fn run() -> Result<()> {
     };
     eprintln!("[tvpilotd] listening on {}", sock.display());
 
-    // Toggle a11y on at startup. Best-effort.
-    if let Err(e) = atspi::enable_a11y().await {
-        eprintln!("[tvpilotd] WARN enable_a11y: {:#}", e);
-    } else {
-        eprintln!("[tvpilotd] a11y enabled");
-    }
-
-    // Hold a single warm AT-SPI connection for the daemon's lifetime.
+    // Connect to the already-running AT-SPI bus. The operator must have
+    // enabled a11y (and triggered app registration via e.g. aurum-bootstrap)
+    // before launching tvpilot. tvpilot is intentionally a thin consumer
+    // here — initial enablement and the apps-populate-tree handshake live
+    // outside tvpilot's scope.
     let atspi_conn = atspi::connect_atspi().await.context("connect at-spi")?;
 
     // Best-effort key injector. Initialization can fail if the daemon doesn't
@@ -109,14 +106,10 @@ pub async fn run() -> Result<()> {
         }
     };
 
-    // Tell the AT-SPI Registry which events we care about. Without this,
-    // apps don't bother populating their tree even with IsEnabled=true —
-    // they only register when at least one AT has subscribed.
-    if let Err(e) = atspi::register_with_registry(&atspi_conn).await {
-        eprintln!("[tvpilotd] WARN Registry RegisterEvent: {:#}", e);
-    } else {
-        eprintln!("[tvpilotd] registered as AT-SPI event listener");
-    }
+    // tvpilot does not enable AT-SPI or register events with the Registry
+    // itself. That is operator setup, performed once on the TV (e.g. via
+    // `app_launcher -s org.tizen.aurum-bootstrap`) before tvpilot runs.
+    // tvpilot is purely a consumer of an already-active a11y bus.
 
     let last_focus: FocusPointer = Arc::new(Mutex::new(None));
     if let Err(e) = atspi::install_focus_listener(&atspi_conn, last_focus.clone()).await {

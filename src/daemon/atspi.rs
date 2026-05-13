@@ -160,66 +160,6 @@ pub async fn connect_atspi() -> Result<Arc<SyncConnection>> {
     Ok(conn)
 }
 
-/// Tell the AT-SPI Registry which events we care about. This is the missing
-/// piece without aurum-bootstrap: AT-SPI's design is "apps only populate
-/// their accessible tree once at least one assistive technology has
-/// subscribed to events." Just toggling `IsEnabled=true` on the session bus
-/// is not enough — apps need to see a subscribed listener.
-///
-/// libatspi does this in `atspi_event_listener_register()`, which internally
-/// calls `Registry.RegisterEvent("Window:Create:")` etc. We do the same set
-/// aurum registers in `AtspiAccessibleWatcher::eventThreadLoop` (libaurum's
-/// `AtspiAccessibleWatcher.cc:116-137`).
-pub async fn register_with_registry(conn: &Arc<SyncConnection>) -> Result<()> {
-    let registry = Proxy::new(
-        "org.a11y.atspi.Registry",
-        "/org/a11y/atspi/registry",
-        TIMEOUT,
-        conn.clone(),
-    );
-    let events = [
-        "Window:Create:",
-        "Window:Destroy:",
-        "Window:Activate:",
-        "Window:Deactivate:",
-        "Window:Restore:",
-        "Window:Raise:",
-        "Window:Lower:",
-        "Window:Minimize:",
-        "Window:Maximize:",
-        "Window:Resize:",
-        "Window:Move:",
-        "Window:PostRender:",
-        "Object:StateChanged:Focused",
-        "Object:StateChanged:Highlighted",
-        "Object:StateChanged:Visible",
-        "Object:StateChanged:Showing",
-        "Object:StateChanged:Selected",
-        "Object:StateChanged:Checked",
-        "Object:StateChanged:Pressed",
-        "Object:StateChanged:Defunct",
-        "Object:StateChanged:Active",
-        "Object:TextChanged:Insert",
-        "Object:TextChanged:Delete",
-        "Object:ChildrenChanged:Add",
-        "Object:ChildrenChanged:Remove",
-        "Object:ActiveDescendantChanged",
-    ];
-    for ev in events.iter() {
-        if let Err(e) = registry
-            .method_call::<(), _, _, _>(
-                "org.a11y.atspi.Registry",
-                "RegisterEvent",
-                (*ev,),
-            )
-            .await
-        {
-            eprintln!("[tvpilotd] WARN RegisterEvent({}): {}", ev, e);
-        }
-    }
-    Ok(())
-}
-
 /// Subscribe to `org.a11y.atspi.Event.Object` StateChanged signals on the
 /// AT-SPI bus and keep `last_focus` pointing at whichever element most
 /// recently set its `focused` or `highlighted` state to true. This lets the
@@ -283,25 +223,6 @@ pub async fn install_focus_listener(
     Ok(())
 }
 
-/// Toggle `org.a11y.Status.IsEnabled = true` on the session bus. On Tizen 10
-/// this is kdbus; libdbus-1 handles it transparently via `new_session_sync`.
-pub async fn enable_a11y() -> Result<()> {
-    let (resource, conn) =
-        dbus_tokio::connection::new_session_sync().context("session bus connect")?;
-    tokio::spawn(async move {
-        let _ = resource.await;
-    });
-    let bus = Proxy::new("org.a11y.Bus", "/org/a11y/bus", TIMEOUT, conn);
-    let v: Variant<bool> = Variant(true);
-    bus.method_call::<(), _, _, _>(
-        ATSPI_PROPS,
-        "Set",
-        ("org.a11y.Status", "IsEnabled", v),
-    )
-    .await
-    .context("Properties.Set IsEnabled")?;
-    Ok(())
-}
 
 /// List every app registered on the AT-SPI bus.
 pub async fn list_apps(conn: &Arc<SyncConnection>) -> Result<Vec<(String, String)>> {
