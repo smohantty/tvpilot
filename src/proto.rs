@@ -1,7 +1,7 @@
 //! Wire protocol between the `tvpilot` CLI and the `tvpilot daemon`.
 //!
-//! Each frame is `u32 LE length` followed by `length` bytes of postcard.
-//! A connection may carry many request/response pairs in order.
+//! Framing on the unix socket: `u32 LE length` followed by `length` bytes of
+//! postcard-encoded payload. Each frame is one `Request` or one `Response`.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,26 +13,14 @@ pub struct Request {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Command {
+    /// Daemon liveness check.
     Ping,
+    /// Snapshot the active window's a11y tree.
     Snap {
         interactive: bool,
         verbose: bool,
     },
-    /// Inject a TV remote key via libcapi-ui-efl-util. `name` is a friendly
-    /// verb ("down", "enter", "back", "volup", …) — the daemon maps it to the
-    /// Tizen efl_util key string.
-    Key {
-        name: String,
-        count: u32,
-    },
-    /// Click an element by its `eN` ref from the most recent snapshot.
-    /// Runs the click ladder (PLAN.md): try direct action → highlight+Enter
-    /// → focus+Enter. Returns a fresh snapshot.
-    Click {
-        ref_id: String,
-        interactive: bool,
-        verbose: bool,
-    },
+    /// Tell the daemon to shut down.
     Close,
 }
 
@@ -47,7 +35,6 @@ pub struct Response {
 pub enum Payload {
     Pong { uptime_ms: u64 },
     Snap(SnapResult),
-    KeySent { count: u32 },
     Closed,
     Error(String),
 }

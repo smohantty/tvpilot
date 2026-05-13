@@ -10,20 +10,21 @@ use tokio::net::{UnixListener, UnixStream};
 use crate::proto::{Command, Payload, Request, Response, SnapResult, Timing};
 
 mod atspi;
-mod input;
 
 use atspi::{FocusPointer, RefEntry};
-use input::{KeyInjector, resolve_key_name};
 
 /// State shared across all connections.
 struct DaemonState {
     atspi: Arc<dbus::nonblock::SyncConnection>,
-    keys: Option<Arc<KeyInjector>>,
-    // RefMap from the most recent snapshot. Click looks refs up here.
+    /// RefMap from the most recent snapshot. Kept around because the agent
+    /// pipeline benefits from stable ref identities across a snap→inspect
+    /// cycle even though we don't yet have an action surface that consumes
+    /// them.
+    #[allow(dead_code)]
     refmap: Mutex<Vec<RefEntry>>,
-    // Element most recently flagged as focused/highlighted via AT-SPI
-    // signals. Compensates for Tizen Dali widgets not setting STATE_FOCUSED
-    // or STATE_HIGHLIGHTED in `GetState` polls.
+    /// Element most recently flagged as focused/highlighted via AT-SPI
+    /// signals. Compensates for Tizen Dali widgets not setting
+    /// STATE_FOCUSED or STATE_HIGHLIGHTED in `GetState` polls.
     last_focus: FocusPointer,
     started: Instant,
 }
@@ -38,33 +39,20 @@ enum BindOutcome {
     Io(std::io::Error),
 }
 
-/// Bind the daemon socket safely:
-///   1. Try `bind` directly. On clean success, done.
-///   2. On `AddrInUse`: probe by `connect`. If the existing socket accepts,
-///      another daemon is already serving — return AnotherDaemonAlive.
-///      If the connect fails, the file is stale — unlink and retry bind once.
-///
-/// This is the "loser of the bind race exits without side effects" pattern
-/// from PLAN.md's Lifecycle table. Replaces the earlier remove-then-bind
-/// path that quietly leaked the original daemon every time someone (us
-/// during testing) `rm`'d the socket file out from under a live process.
+/// Bind the daemon socket safely. Try bind directly; on AddrInUse, probe by
+/// connect. If the existing socket accepts, another daemon is alive — return
+/// without taking over. If it doesn't, the file is stale; unlink and retry.
 async fn bind_socket(sock: &PathBuf) -> Result<UnixListener, BindOutcome> {
     match UnixListener::bind(sock) {
         Ok(l) => return Ok(l),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // Probe before clobbering.
-            match UnixStream::connect(sock).await {
-                Ok(_) => return Err(BindOutcome::AnotherDaemonAlive),
-                Err(_) => {
-                    // Stale socket file — safe to remove and retry.
-                    eprintln!(
-                        "[tvpilotd] stale socket at {}, reclaiming",
-                        sock.display()
-                    );
-                    let _ = std::fs::remove_file(sock);
-                }
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => match UnixStream::connect(sock).await
+        {
+            Ok(_) => return Err(BindOutcome::AnotherDaemonAlive),
+            Err(_) => {
+                eprintln!("[tvpilotd] stale socket at {}, reclaiming", sock.display());
+                let _ = std::fs::remove_file(sock);
             }
-        }
+        },
         Err(e) => return Err(BindOutcome::Io(e)),
     }
     UnixListener::bind(sock).map_err(BindOutcome::Io)
@@ -76,7 +64,7 @@ pub async fn run() -> Result<()> {
         Ok(l) => l,
         Err(BindOutcome::AnotherDaemonAlive) => {
             eprintln!(
-                "[tvpilotd] another daemon is already alive on {} — exiting without side effects",
+                "[tvpilotd] another daemon is already alive on {} — exiting",
                 sock.display()
             );
             return Ok(());
@@ -85,31 +73,10 @@ pub async fn run() -> Result<()> {
     };
     eprintln!("[tvpilotd] listening on {}", sock.display());
 
-    // Connect to the already-running AT-SPI bus. The operator must have
-    // enabled a11y (and triggered app registration via e.g. aurum-bootstrap)
-    // before launching tvpilot. tvpilot is intentionally a thin consumer
-    // here — initial enablement and the apps-populate-tree handshake live
-    // outside tvpilot's scope.
+    // Attach to the already-running AT-SPI bus. The operator is expected to
+    // have brought up a11y (e.g. via `app_launcher -s
+    // org.tizen.aurum-bootstrap`) before tvpilot runs.
     let atspi_conn = atspi::connect_atspi().await.context("connect at-spi")?;
-
-    // Best-effort key injector. Initialization can fail if the daemon doesn't
-    // have the right Tizen capability; in that case `key`/`click` will error
-    // out but `snap` still works.
-    let keys = match KeyInjector::new() {
-        Ok(k) => {
-            eprintln!("[tvpilotd] key injector ready");
-            Some(Arc::new(k))
-        }
-        Err(e) => {
-            eprintln!("[tvpilotd] WARN no key injector: {:#}", e);
-            None
-        }
-    };
-
-    // tvpilot does not enable AT-SPI or register events with the Registry
-    // itself. That is operator setup, performed once on the TV (e.g. via
-    // `app_launcher -s org.tizen.aurum-bootstrap`) before tvpilot runs.
-    // tvpilot is purely a consumer of an already-active a11y bus.
 
     let last_focus: FocusPointer = Arc::new(Mutex::new(None));
     if let Err(e) = atspi::install_focus_listener(&atspi_conn, last_focus.clone()).await {
@@ -120,7 +87,6 @@ pub async fn run() -> Result<()> {
 
     let state = Arc::new(DaemonState {
         atspi: atspi_conn,
-        keys,
         refmap: Mutex::new(Vec::new()),
         last_focus,
         started: Instant::now(),
@@ -139,7 +105,7 @@ async fn handle(mut stream: UnixStream, state: Arc<DaemonState>) -> Result<()> {
     loop {
         let req = match read_frame::<Request>(&mut stream).await {
             Ok(r) => r,
-            Err(_) => return Ok(()), // peer closed
+            Err(_) => return Ok(()),
         };
         let resp = dispatch(req, state.clone()).await;
         let close = matches!(&resp.payload, Payload::Closed);
@@ -162,146 +128,20 @@ async fn dispatch(req: Request, state: Arc<DaemonState>) -> Response {
             uptime_ms: state.started.elapsed().as_millis() as u64,
         },
         Command::Close => Payload::Closed,
-        Command::Snap { interactive, verbose } => {
-            match do_snap(&state, interactive, verbose, &mut timing).await {
-                Ok(r) => Payload::Snap(r),
-                Err(e) => Payload::Error(format!("{:#}", e)),
-            }
-        }
-        Command::Key { name, count } => match do_key(&state, &name, count) {
-            Ok(c) => Payload::KeySent { count: c },
+        Command::Snap {
+            interactive,
+            verbose,
+        } => match do_snap(&state, interactive, verbose, &mut timing).await {
+            Ok(r) => Payload::Snap(r),
             Err(e) => Payload::Error(format!("{:#}", e)),
         },
-        Command::Click { ref_id, interactive, verbose } => {
-            match do_click(&state, &ref_id, interactive, verbose, &mut timing).await {
-                Ok(r) => Payload::Snap(r),
-                Err(e) => Payload::Error(format!("{:#}", e)),
-            }
-        }
     };
     timing.total_ms = t0.elapsed().as_millis() as u32;
-    Response { rid, payload, timing }
-}
-
-fn do_key(state: &Arc<DaemonState>, name: &str, count: u32) -> Result<u32> {
-    let inj = state
-        .keys
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("no key injector — daemon failed to init efl_util"))?;
-    let key = resolve_key_name(name)?;
-    inj.send_key(key, count)?;
-    Ok(count.max(1))
-}
-
-async fn do_click(
-    state: &Arc<DaemonState>,
-    ref_id: &str,
-    interactive: bool,
-    verbose: bool,
-    timing: &mut Timing,
-) -> Result<SnapResult> {
-    // Resolve `eN` → RefEntry from the most recent snapshot's RefMap.
-    let target = {
-        let map = state.refmap.lock().unwrap();
-        let idx = parse_ref_id(ref_id)
-            .ok_or_else(|| anyhow::anyhow!("malformed ref '{}': expected eN", ref_id))?;
-        if idx == 0 || idx > map.len() {
-            return Err(anyhow::anyhow!(
-                "RefUnknown: '{}' not in current snapshot (snapshot has {} refs)",
-                ref_id,
-                map.len()
-            ));
-        }
-        map[idx - 1].clone()
-    };
-    eprintln!(
-        "[tvpilotd] click {} → {} {}",
-        ref_id, target.sender, target.path
-    );
-
-    // Click ladder. Best-effort, fall through to the next rung on any failure.
-    let mut path_used = "unknown".to_string();
-
-    // Rung 1: already focused/highlighted? → send Enter.
-    if let Ok(s) = atspi::get_state(&state.atspi, &target.sender, &target.path).await {
-        if s.focused() {
-            if let Some(inj) = state.keys.as_ref() {
-                inj.send_key("Return", 1).ok();
-                path_used = "focused+Enter".to_string();
-            }
-        }
+    Response {
+        rid,
+        payload,
+        timing,
     }
-
-    // Rung 2: direct Action.click / Action.activate.
-    if path_used == "unknown" {
-        if let Some(idx) =
-            atspi::find_action(&state.atspi, &target.sender, &target.path).await
-        {
-            match atspi::do_action(&state.atspi, &target.sender, &target.path, idx).await {
-                Ok(true) => path_used = format!("DoAction({})", idx),
-                Ok(false) => eprintln!("[tvpilotd] DoAction({}) returned false", idx),
-                Err(e) => eprintln!("[tvpilotd] DoAction failed: {:#}", e),
-            }
-        }
-    }
-
-    // Rung 3: GrabHighlight, then Enter.
-    if path_used == "unknown" {
-        match atspi::grab_highlight(&state.atspi, &target.sender, &target.path).await {
-            Ok(true) => {
-                if let Some(inj) = state.keys.as_ref() {
-                    inj.send_key("Return", 1).ok();
-                }
-                path_used = "GrabHighlight+Enter".to_string();
-            }
-            _ => {}
-        }
-    }
-
-    // Rung 4: GrabFocus, then Enter.
-    if path_used == "unknown" {
-        match atspi::grab_focus(&state.atspi, &target.sender, &target.path).await {
-            Ok(true) => {
-                if let Some(inj) = state.keys.as_ref() {
-                    inj.send_key("Return", 1).ok();
-                }
-                path_used = "GrabFocus+Enter".to_string();
-            }
-            _ => {}
-        }
-    }
-
-    if path_used == "unknown" {
-        return Err(anyhow::anyhow!(
-            "all click ladder rungs failed for {} ({})",
-            ref_id,
-            target.role
-        ));
-    }
-    eprintln!("[tvpilotd] click path: {}", path_used);
-
-    // Wait for AT-SPI to have a stable active app again. Replaces the old
-    // fixed 150 ms sleep — covers both same-app actions (short wait) and
-    // cross-app transitions where the old app drops STATE_ACTIVE but the
-    // new app hasn't registered yet.
-    let t = std::time::Instant::now();
-    let stable = atspi::wait_for_active_app(&state.atspi, std::time::Duration::from_millis(1500)).await;
-    eprintln!(
-        "[tvpilotd] post-action stabilise: {} after {:?}",
-        if stable { "active" } else { "timeout" },
-        t.elapsed()
-    );
-
-    do_snap(state, interactive, verbose, timing).await
-}
-
-fn parse_ref_id(s: &str) -> Option<usize> {
-    let trimmed = s
-        .strip_prefix("ref=")
-        .or_else(|| s.strip_prefix('@'))
-        .unwrap_or(s);
-    let n = trimmed.strip_prefix('e')?;
-    n.parse::<usize>().ok()
 }
 
 async fn do_snap(
@@ -318,9 +158,6 @@ async fn do_snap(
     let active = atspi::find_active_app(atspi, &apps).await;
     timing.detect_ms = t.elapsed().as_millis() as u32;
 
-    // Walk targets: active app if we found one, otherwise every app
-    // (the SHOWING prune inside the walker will collapse background apps
-    // to empty subtrees cheaply).
     let targets: Vec<(String, String)> = match &active {
         Some(a) => {
             eprintln!("[tvpilotd] active app: {}", a.0);
@@ -373,8 +210,6 @@ async fn do_snap(
         }
         combined_refmap.extend(rm.iter().cloned());
     }
-
-    // Publish the RefMap so subsequent `click`/`focus` can resolve refs.
     *state.refmap.lock().unwrap() = combined_refmap;
 
     Ok(SnapResult {

@@ -30,7 +30,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
     let mut iter = args.iter();
     let verb = iter
         .next()
-        .ok_or_else(|| anyhow::anyhow!("usage: tvpilot <snap|click|key|ping|close> [...]"))?;
+        .ok_or_else(|| anyhow!("usage: tvpilot <snap|ping|close> [...]"))?;
     match verb.as_str() {
         "ping" => Ok(Command::Ping),
         "close" => Ok(Command::Close),
@@ -49,40 +49,7 @@ fn parse_args(args: &[String]) -> Result<Command> {
                 verbose,
             })
         }
-        "key" => {
-            let name = iter
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: tvpilot key <name> [count]"))?
-                .clone();
-            let count = match iter.next() {
-                Some(s) => s
-                    .parse::<u32>()
-                    .map_err(|_| anyhow::anyhow!("count must be a positive integer"))?,
-                None => 1,
-            };
-            Ok(Command::Key { name, count })
-        }
-        "click" => {
-            let ref_id = iter
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: tvpilot click <eN> [-i] [-v]"))?
-                .clone();
-            let mut interactive = false;
-            let mut verbose = false;
-            for arg in iter {
-                match arg.as_str() {
-                    "-i" | "--interactive" => interactive = true,
-                    "-v" | "--verbose" => verbose = true,
-                    other => anyhow::bail!("unknown flag for click: {}", other),
-                }
-            }
-            Ok(Command::Click {
-                ref_id,
-                interactive,
-                verbose,
-            })
-        }
-        _ => Err(anyhow::anyhow!("unknown verb: {}", verb)),
+        _ => Err(anyhow!("unknown verb: {}", verb)),
     }
 }
 
@@ -91,8 +58,6 @@ async fn send_command(cmd: &Command) -> Result<Response> {
     let mut stream = match UnixStream::connect(&sock).await {
         Ok(s) => s,
         Err(_) if matches!(cmd, Command::Close) => {
-            // Closing a daemon that isn't running is success. Don't auto-
-            // spawn one just to immediately tell it to close.
             return Ok(Response {
                 rid: 0,
                 payload: Payload::Closed,
@@ -100,10 +65,6 @@ async fn send_command(cmd: &Command) -> Result<Response> {
             });
         }
         Err(_) => {
-            // Daemon not running — auto-spawn and retry. Matches PLAN.md's
-            // lifecycle: "CLI connects to socket → fails → re-execs
-            // /proc/self/exe daemon as detached child → polls socket up to
-            // 2 s with backoff → connects".
             eprintln!("[tvpilot] daemon not running, spawning...");
             spawn_daemon_detached().context("spawn daemon")?;
             wait_for_socket(&sock, Duration::from_secs(3))
@@ -140,41 +101,11 @@ async fn send_command(cmd: &Command) -> Result<Response> {
     Ok(resp)
 }
 
-fn clone_command(c: &Command) -> Command {
-    match c {
-        Command::Ping => Command::Ping,
-        Command::Close => Command::Close,
-        Command::Snap {
-            interactive,
-            verbose,
-        } => Command::Snap {
-            interactive: *interactive,
-            verbose: *verbose,
-        },
-        Command::Key { name, count } => Command::Key {
-            name: name.clone(),
-            count: *count,
-        },
-        Command::Click {
-            ref_id,
-            interactive,
-            verbose,
-        } => Command::Click {
-            ref_id: ref_id.clone(),
-            interactive: *interactive,
-            verbose: *verbose,
-        },
-    }
-}
-
 fn spawn_daemon_detached() -> Result<()> {
     use std::os::unix::process::CommandExt;
 
     let exe = std::env::current_exe().context("locate /proc/self/exe")?;
 
-    // Pipe stdio to a log file so the daemon doesn't get SIGPIPE after the
-    // CLI exits. Best-effort — fall back to /dev/null if the log file can't
-    // be created.
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/5001".into());
     let log_path = format!("{}/tvpilotd.log", runtime);
     let (stdout, stderr) = match File::create(&log_path) {
@@ -194,9 +125,6 @@ fn spawn_daemon_detached() -> Result<()> {
         .stdout(stdout)
         .stderr(stderr);
 
-    // Detach from the parent's controlling terminal and process group. Without
-    // setsid the calling shell waits on the daemon's FDs (or its session) and
-    // the CLI invocation appears to hang.
     unsafe {
         cmd.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -229,6 +157,20 @@ async fn wait_for_socket(sock: &Path, timeout: Duration) -> Result<()> {
     ))
 }
 
+fn clone_command(c: &Command) -> Command {
+    match c {
+        Command::Ping => Command::Ping,
+        Command::Close => Command::Close,
+        Command::Snap {
+            interactive,
+            verbose,
+        } => Command::Snap {
+            interactive: *interactive,
+            verbose: *verbose,
+        },
+    }
+}
+
 fn render(resp: Response) {
     match resp.payload {
         Payload::Pong { uptime_ms } => {
@@ -251,12 +193,6 @@ fn render(resp: Response) {
                 resp.timing.total_ms
             );
             print!("{}", s.rendered);
-        }
-        Payload::KeySent { count } => {
-            eprintln!(
-                "[tvpilot] sent {} key event(s) in {}ms",
-                count, resp.timing.total_ms
-            );
         }
     }
 }

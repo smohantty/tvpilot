@@ -242,32 +242,6 @@ pub async fn list_apps(conn: &Arc<SyncConnection>) -> Result<Vec<(String, String
         .collect())
 }
 
-/// Wait until at least one app on the AT-SPI bus has STATE_ACTIVE set. Polls
-/// every ~75 ms until either an active app appears or `timeout` elapses.
-///
-/// Used after click/action commands to ride out the cross-app transition
-/// window during which the old app drops STATE_ACTIVE but the new app hasn't
-/// registered yet. Returns true if a stable active app was observed.
-pub async fn wait_for_active_app(
-    conn: &Arc<SyncConnection>,
-    timeout: Duration,
-) -> bool {
-    // Tiny up-front sleep so simple same-app actions (where the active app
-    // never goes away) don't poll instantly and return a half-rendered tree.
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let apps = list_apps(conn).await.unwrap_or_default();
-        if find_active_app(conn, &apps).await.is_some() {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(75)).await;
-    }
-}
-
 /// Probe every app's root state in parallel and return the one with
 /// `STATE_ACTIVE` set. Confirmed on Tizen 10: only the foreground app sets it.
 pub async fn find_active_app(
@@ -313,90 +287,12 @@ pub struct Node {
 /// element later (click ladder, etc.) — `(bus_name, object_path, role, name)`
 /// per PLAN.md "Ref design".
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct RefEntry {
     pub sender: String,
     pub path: String,
     pub role: String,
     pub name: String,
-}
-
-/// Read the AT-SPI state bits for one element.
-pub async fn get_state(
-    conn: &Arc<SyncConnection>,
-    sender: &str,
-    path: &str,
-) -> Result<StateBits> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (v,): (Vec<u32>,) = proxy
-        .method_call(ATSPI_ACCESSIBLE, "GetState", ())
-        .await
-        .context("GetState")?;
-    Ok(StateBits::from_vec(v))
-}
-
-/// Probe `Action.GetActions` and look for one named "click" or "activate".
-/// Returns its index for `DoAction(idx)`.
-pub async fn find_action(
-    conn: &Arc<SyncConnection>,
-    sender: &str,
-    path: &str,
-) -> Option<i32> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    // GetActions returns a(sss) — array of (name, description, key_binding).
-    let (actions,): (Vec<(String, String, String)>,) = proxy
-        .method_call("org.a11y.atspi.Action", "GetActions", ())
-        .await
-        .ok()?;
-    for (i, (name, _, _)) in actions.iter().enumerate() {
-        let n = name.to_ascii_lowercase();
-        if n == "click" || n == "activate" || n == "default" {
-            return Some(i as i32);
-        }
-    }
-    None
-}
-
-/// Invoke `Action.DoAction(idx)` on the element.
-pub async fn do_action(
-    conn: &Arc<SyncConnection>,
-    sender: &str,
-    path: &str,
-    idx: i32,
-) -> Result<bool> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (ok,): (bool,) = proxy
-        .method_call("org.a11y.atspi.Action", "DoAction", (idx,))
-        .await
-        .context("DoAction")?;
-    Ok(ok)
-}
-
-/// `Component.GrabHighlight` — Samsung TV-nav focus (visible highlight cursor).
-pub async fn grab_highlight(
-    conn: &Arc<SyncConnection>,
-    sender: &str,
-    path: &str,
-) -> Result<bool> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (ok,): (bool,) = proxy
-        .method_call("org.a11y.atspi.Component", "GrabHighlight", ())
-        .await
-        .context("GrabHighlight")?;
-    Ok(ok)
-}
-
-/// `Component.GrabFocus` — input-focus fallback when highlight isn't supported.
-pub async fn grab_focus(
-    conn: &Arc<SyncConnection>,
-    sender: &str,
-    path: &str,
-) -> Result<bool> {
-    let proxy = Proxy::new(sender.to_string(), path.to_string(), TIMEOUT, conn.clone());
-    let (ok,): (bool,) = proxy
-        .method_call("org.a11y.atspi.Component", "GrabFocus", ())
-        .await
-        .context("GrabFocus")?;
-    Ok(ok)
 }
 
 /// Phase 1: concurrent walk → in-memory `Node` tree.
