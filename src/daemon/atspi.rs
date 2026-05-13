@@ -5,10 +5,16 @@
 use anyhow::{Context, Result};
 use dbus::arg::Variant;
 use dbus::channel::Channel;
+use dbus::message::{MatchRule, MessageType};
 use dbus::nonblock::{Proxy, SyncConnection};
 use futures::future::{BoxFuture, FutureExt};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// Pointer to the element AT-SPI most recently flagged as
+/// focused/highlighted. Updated by the signal listener task, read by render
+/// to overlay the `*` marker even when `GetState` doesn't reflect it.
+pub type FocusPointer = Arc<Mutex<Option<(String, String)>>>;
 
 // ─── role tiers, per PLAN.md "Role classification" ──────────────────────────
 const INTERACTIVE_ROLES: &[&str] = &[
@@ -152,6 +158,69 @@ pub async fn connect_atspi() -> Result<Arc<SyncConnection>> {
         eprintln!("[tvpilotd] at-spi resource ended: {}", err);
     });
     Ok(conn)
+}
+
+/// Subscribe to `org.a11y.atspi.Event.Object` StateChanged signals on the
+/// AT-SPI bus and keep `last_focus` pointing at whichever element most
+/// recently set its `focused` or `highlighted` state to true. This lets the
+/// agent track the TV-nav cursor even when `GetState` on the element no
+/// longer reflects it (a Tizen Dali quirk — events fire but state polls
+/// don't show the bit).
+pub async fn install_focus_listener(
+    conn: &Arc<SyncConnection>,
+    last_focus: FocusPointer,
+) -> Result<()> {
+    // Tell the AT-SPI bus daemon to forward signals matching our rule.
+    let dbus_proxy = Proxy::new(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        TIMEOUT,
+        conn.clone(),
+    );
+    let rule_str =
+        "type='signal',interface='org.a11y.atspi.Event.Object',member='StateChanged'";
+    dbus_proxy
+        .method_call::<(), _, _, _>("org.freedesktop.DBus", "AddMatch", (rule_str,))
+        .await
+        .context("AddMatch StateChanged")?;
+
+    let mr = MatchRule::new()
+        .with_type(MessageType::Signal)
+        .with_interface("org.a11y.atspi.Event.Object")
+        .with_member("StateChanged");
+
+    use dbus::channel::MatchingReceiver;
+    conn.start_receive(
+        mr,
+        Box::new(move |msg, _| {
+            // AT-SPI StateChanged body: (siiv(so))
+            //   detail  = state name e.g. "focused", "highlighted"
+            //   detail1 = 1 (set) or 0 (cleared)
+            let mut it = msg.iter_init();
+            let detail: String = match it.read() {
+                Ok(s) => s,
+                Err(_) => return true,
+            };
+            let value: i32 = it.read().unwrap_or(0);
+            if value != 1 {
+                return true; // only "becomes-set"
+            }
+            if detail != "focused" && detail != "highlighted" {
+                return true;
+            }
+            let sender = match msg.sender() {
+                Some(s) => s.to_string(),
+                None => return true,
+            };
+            let path = match msg.path() {
+                Some(p) => p.to_string(),
+                None => return true,
+            };
+            *last_focus.lock().unwrap() = Some((sender, path));
+            true
+        }),
+    );
+    Ok(())
 }
 
 /// Toggle `org.a11y.Status.IsEnabled = true` on the session bus. On Tizen 10
@@ -331,12 +400,22 @@ pub async fn walk(
     path: String,
     interactive_only: bool,
     verbose: bool,
+    focus: Option<(String, String)>,
 ) -> (String, u32, Vec<RefEntry>) {
     let root = build_tree(conn, sender, path).await;
     let mut refmap: Vec<RefEntry> = Vec::new();
     let mut out = String::new();
     let mut total: u32 = 0;
-    render(&root, 0, &mut refmap, &mut out, &mut total, interactive_only, verbose);
+    render(
+        &root,
+        0,
+        &mut refmap,
+        &mut out,
+        &mut total,
+        interactive_only,
+        verbose,
+        focus.as_ref(),
+    );
     (out, total, refmap)
 }
 
@@ -449,6 +528,7 @@ fn render(
     total: &mut u32,
     interactive_only: bool,
     verbose: bool,
+    focus: Option<&(String, String)>,
 ) {
     if !node.state.showing() {
         return;
@@ -469,11 +549,14 @@ fn render(
         });
 
         let pad = " ".repeat(indent * 2);
-        // On Tizen TVs the visible navigation cursor is STATE_HIGHLIGHTED
-        // (Samsung extension, bit 41 highlightable / bit 39 highlighted),
-        // NOT the standard ATSPI STATE_FOCUSED (which web-style widgets use).
-        // We mark on either so both worlds show up.
-        let focused_now = node.state.focused() || node.state.highlighted();
+        // Mark focused on either the live state bits (works on standard
+        // a11y) or the event-tracked focus pointer (works on Tizen Dali,
+        // where state bits stay 0 but events fire).
+        let focused_by_state = node.state.focused() || node.state.highlighted();
+        let focused_by_event = focus
+            .map(|(s, p)| s == &node.sender && p == &node.path)
+            .unwrap_or(false);
+        let focused_now = focused_by_state || focused_by_event;
         let marker = if focused_now { "*" } else { "" };
         let label_part = if label.is_empty() {
             String::new()
@@ -507,6 +590,7 @@ fn render(
             total,
             interactive_only,
             verbose,
+            focus,
         );
     }
 }

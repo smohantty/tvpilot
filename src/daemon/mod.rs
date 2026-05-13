@@ -12,7 +12,7 @@ use crate::proto::{Command, Payload, Request, Response, SnapResult, Timing};
 mod atspi;
 mod input;
 
-use atspi::RefEntry;
+use atspi::{FocusPointer, RefEntry};
 use input::{KeyInjector, resolve_key_name};
 
 /// State shared across all connections.
@@ -21,6 +21,10 @@ struct DaemonState {
     keys: Option<Arc<KeyInjector>>,
     // RefMap from the most recent snapshot. Click looks refs up here.
     refmap: Mutex<Vec<RefEntry>>,
+    // Element most recently flagged as focused/highlighted via AT-SPI
+    // signals. Compensates for Tizen Dali widgets not setting STATE_FOCUSED
+    // or STATE_HIGHLIGHTED in `GetState` polls.
+    last_focus: FocusPointer,
     started: Instant,
 }
 
@@ -59,10 +63,18 @@ pub async fn run() -> Result<()> {
         }
     };
 
+    let last_focus: FocusPointer = Arc::new(Mutex::new(None));
+    if let Err(e) = atspi::install_focus_listener(&atspi_conn, last_focus.clone()).await {
+        eprintln!("[tvpilotd] WARN focus listener: {:#}", e);
+    } else {
+        eprintln!("[tvpilotd] focus listener installed");
+    }
+
     let state = Arc::new(DaemonState {
         atspi: atspi_conn,
         keys,
         refmap: Mutex::new(Vec::new()),
+        last_focus,
         started: Instant::now(),
     });
     eprintln!("[tvpilotd] ready");
@@ -267,6 +279,7 @@ async fn do_snap(
         }
     };
 
+    let focus_snapshot: Option<(String, String)> = state.last_focus.lock().unwrap().clone();
     let t = Instant::now();
     let walks: Vec<_> = targets
         .iter()
@@ -277,6 +290,7 @@ async fn do_snap(
                 p.clone(),
                 interactive,
                 verbose,
+                focus_snapshot.clone(),
             )
         })
         .collect();
