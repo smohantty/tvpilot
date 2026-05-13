@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::proto::{Command, Payload, Request, Response};
+use crate::proto::{Command, Payload, Request, Response, Timing};
 
 pub fn socket_path() -> PathBuf {
     let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/5001".into());
@@ -90,6 +90,15 @@ async fn send_command(cmd: &Command) -> Result<Response> {
     let sock = socket_path();
     let mut stream = match UnixStream::connect(&sock).await {
         Ok(s) => s,
+        Err(_) if matches!(cmd, Command::Close) => {
+            // Closing a daemon that isn't running is success. Don't auto-
+            // spawn one just to immediately tell it to close.
+            return Ok(Response {
+                rid: 0,
+                payload: Payload::Closed,
+                timing: Timing::default(),
+            });
+        }
         Err(_) => {
             // Daemon not running — auto-spawn and retry. Matches PLAN.md's
             // lifecycle: "CLI connects to socket → fails → re-execs
