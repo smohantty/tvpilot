@@ -11,7 +11,7 @@ use crate::proto::{Command, Payload, Request, Response, SnapResult, Timing};
 
 mod atspi;
 
-use atspi::{FocusPointer, RefEntry};
+use atspi::{FocusPointer, Node, RefEntry};
 
 /// State shared across all connections.
 struct DaemonState {
@@ -174,43 +174,60 @@ async fn do_snap(
 
     let focus_snapshot: Option<(String, String)> = state.last_focus.lock().unwrap().clone();
     let t = Instant::now();
-    let walks: Vec<_> = targets
+    let builds: Vec<_> = targets
         .iter()
-        .map(|(s, p)| {
-            atspi::walk(
-                atspi.clone(),
-                s.clone(),
-                p.clone(),
-                interactive,
-                verbose,
-                focus_snapshot.clone(),
-            )
-        })
+        .map(|(s, p)| atspi::build_tree(atspi.clone(), s.clone(), p.clone()))
         .collect();
-    let results = futures::future::join_all(walks).await;
+    let trees: Vec<Node> = futures::future::join_all(builds).await;
     timing.walk_ms = t.elapsed().as_millis() as u32;
+
+    let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+
+    // Cross-check artifact: every node we fetched from AT-SPI, before any
+    // filtering or label hoisting in render.
+    {
+        let mut raw_dump = String::new();
+        for ((sender, _), tree) in targets.iter().zip(trees.iter()) {
+            raw_dump.push_str(&format!("# app={}\n", sender));
+            raw_dump.push_str(&atspi::dump_raw(tree));
+        }
+        let raw_path = format!("{}/tvpilot-raw.txt", runtime);
+        if let Err(e) = std::fs::write(&raw_path, &raw_dump) {
+            eprintln!("[tvpilotd] WARN raw-dump write {}: {}", raw_path, e);
+        }
+    }
 
     let mut rendered = String::new();
     let mut node_count = 0u32;
     let mut chosen_bus = String::new();
     let mut chosen_nodes = 0u32;
     let mut combined_refmap: Vec<RefEntry> = Vec::new();
-    for ((sender, _), (r, c, rm)) in targets.iter().zip(results.iter()) {
+    for ((sender, _), tree) in targets.iter().zip(trees.iter()) {
+        let (r, c, rm) = atspi::render_tree(tree, interactive, verbose, focus_snapshot.clone());
         node_count += c;
-        if *c == 0 {
+        if c == 0 {
             continue;
         }
-        if *c > chosen_nodes {
+        if c > chosen_nodes {
             chosen_bus = sender.clone();
-            chosen_nodes = *c;
+            chosen_nodes = c;
         }
         if !r.is_empty() {
             rendered.push_str(&format!("# app={}\n", sender));
-            rendered.push_str(r);
+            rendered.push_str(&r);
         }
-        combined_refmap.extend(rm.iter().cloned());
+        combined_refmap.extend(rm);
     }
     *state.refmap.lock().unwrap() = combined_refmap;
+
+    // Cross-check artifact: the post-filter, post-hoist rendered tree the
+    // agent sees. Diff against tvpilot-raw.txt to spot lost signal.
+    {
+        let rendered_path = format!("{}/tvpilot-rendered.txt", runtime);
+        if let Err(e) = std::fs::write(&rendered_path, &rendered) {
+            eprintln!("[tvpilotd] WARN rendered-dump write {}: {}", rendered_path, e);
+        }
+    }
 
     Ok(SnapResult {
         app_bus: if chosen_bus.is_empty() {

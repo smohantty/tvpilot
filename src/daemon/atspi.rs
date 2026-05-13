@@ -8,6 +8,7 @@ use dbus::channel::Channel;
 use dbus::message::{MatchRule, MessageType};
 use dbus::nonblock::{Proxy, SyncConnection};
 use futures::future::{BoxFuture, FutureExt};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -88,8 +89,12 @@ fn role_tier(role: &str) -> Tier {
 }
 
 const ATSPI_ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
+const ATSPI_COMPONENT: &str = "org.a11y.atspi.Component";
 const ATSPI_PROPS: &str = "org.freedesktop.DBus.Properties";
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// AT-SPI Component.GetExtents coord types.
+const COORD_SCREEN: u32 = 0;
 
 // AT-SPI state bit indices (atspi-constants.h).
 const STATE_ACTIVE: u32 = 1;
@@ -273,6 +278,11 @@ pub async fn find_active_app(
 /// assigned — that happens deterministically in a sequential render pass so
 /// `eN` ids match tree-traversal order regardless of which `tokio::join!`
 /// future finished first.
+///
+/// `extents` and `attributes` are not yet consumed by render; we fetch them
+/// so the daemon's per-node work matches aurum's fallback path
+/// (`updateExtents` + `updateAttributes`) for an apples-to-apples Rust-vs-C++
+/// perf comparison. They also land in `tvpilot-raw.txt` for inspection.
 pub struct Node {
     pub sender: String,
     pub path: String,
@@ -280,6 +290,8 @@ pub struct Node {
     pub name: String,
     pub description: String,
     pub state: StateBits,
+    pub extents: Option<(i32, i32, i32, i32)>,
+    pub attributes: Vec<(String, String)>,
     pub children: Vec<Node>,
 }
 
@@ -295,34 +307,9 @@ pub struct RefEntry {
     pub name: String,
 }
 
-/// Phase 1: concurrent walk → in-memory `Node` tree.
-/// Phase 2: sequential render with monotonic `eN` ref assignment.
-pub async fn walk(
-    conn: Arc<SyncConnection>,
-    sender: String,
-    path: String,
-    interactive_only: bool,
-    verbose: bool,
-    focus: Option<(String, String)>,
-) -> (String, u32, Vec<RefEntry>) {
-    let root = build_tree(conn, sender, path).await;
-    let mut refmap: Vec<RefEntry> = Vec::new();
-    let mut out = String::new();
-    let mut total: u32 = 0;
-    render(
-        &root,
-        0,
-        &mut refmap,
-        &mut out,
-        &mut total,
-        interactive_only,
-        verbose,
-        focus.as_ref(),
-    );
-    (out, total, refmap)
-}
-
-fn build_tree(
+/// Phase 1: concurrent walk → in-memory `Node` tree. Public so callers can
+/// dump or transform the raw tree before rendering.
+pub fn build_tree(
     conn: Arc<SyncConnection>,
     sender: String,
     path: String,
@@ -330,9 +317,13 @@ fn build_tree(
     async move {
         let proxy = Proxy::new(sender.clone(), path.clone(), TIMEOUT, conn.clone());
 
-        // 5 calls per node — all fan out concurrently. Description is often
-        // the user-visible label for Dali widgets where Name is an internal
-        // identifier; we surface whichever reads as more meaningful at render.
+        // 7 calls per node, all fanned out concurrently. Matches aurum's
+        // fallback path (updateRoleName / updateName+Desc / updateStates /
+        // updateExtents / updateAttributes / GetChildren). Description is
+        // often the user-visible label on Dali widgets; extents and
+        // attributes are kept on the Node so per-node fetch volume is
+        // comparable for the Rust-vs-C++ measurement, even when render
+        // ignores them.
         let role_f = proxy.method_call::<(String,), _, _, _>(ATSPI_ACCESSIBLE, "GetRoleName", ());
         let name_f = proxy.method_call::<(Variant<String>,), _, _, _>(
             ATSPI_PROPS,
@@ -345,18 +336,37 @@ fn build_tree(
             (ATSPI_ACCESSIBLE, "Description"),
         );
         let state_f = proxy.method_call::<(Vec<u32>,), _, _, _>(ATSPI_ACCESSIBLE, "GetState", ());
+        let extents_f = proxy.method_call::<((i32, i32, i32, i32),), _, _, _>(
+            ATSPI_COMPONENT,
+            "GetExtents",
+            (COORD_SCREEN,),
+        );
+        let attrs_f = proxy.method_call::<(HashMap<String, String>,), _, _, _>(
+            ATSPI_ACCESSIBLE,
+            "GetAttributes",
+            (),
+        );
         let children_f = proxy.method_call::<(Vec<(String, dbus::Path<'static>)>,), _, _, _>(
             ATSPI_ACCESSIBLE,
             "GetChildren",
             (),
         );
 
-        let (role, name, desc, state, children) =
-            tokio::join!(role_f, name_f, desc_f, state_f, children_f);
+        let (role, name, desc, state, extents, attrs, children) = tokio::join!(
+            role_f, name_f, desc_f, state_f, extents_f, attrs_f, children_f
+        );
         let role = role.map(|(s,)| s).unwrap_or_else(|_| "?".to_string());
         let name = name.map(|(Variant(s),)| s).unwrap_or_default();
         let description = desc.map(|(Variant(s),)| s).unwrap_or_default();
         let state = StateBits::from_vec(state.map(|(v,)| v).unwrap_or_default());
+        let extents = extents.map(|(r,)| r).ok();
+        let attributes: Vec<(String, String)> = attrs
+            .map(|(m,)| {
+                let mut v: Vec<(String, String)> = m.into_iter().collect();
+                v.sort_by(|a, b| a.0.cmp(&b.0));
+                v
+            })
+            .unwrap_or_default();
         let children_pairs = children.map(|(v,)| v).unwrap_or_default();
 
         // Visibility prune at fetch time: skip walking !SHOWING subtrees.
@@ -375,6 +385,8 @@ fn build_tree(
                 name,
                 description,
                 state,
+                extents,
+                attributes,
                 children: Vec::new(),
             };
         }
@@ -392,6 +404,8 @@ fn build_tree(
             name,
             description,
             state,
+            extents,
+            attributes,
             children,
         }
     }
@@ -418,17 +432,55 @@ fn ref_bearing(node: &Node) -> bool {
     }
 }
 
-/// Pick the most human-readable label for this node. On Tizen Dali widgets,
-/// `Name` is usually an internal identifier ("d/ug.content.category@…");
-/// `Description` is often the user-visible label. We prefer Description when
-/// it's non-empty AND distinct from Name (some widgets duplicate them);
-/// otherwise fall back to Name.
-fn label_of(node: &Node) -> &str {
+/// Heuristic for "this label is a Tizen Dali widget identifier rather than
+/// something a human or LLM would want to read." We use this to decide
+/// whether to hoist a descendant's text label up to a wrapper.
+fn is_widget_id(s: &str) -> bool {
+    s.contains('@')
+        || s.starts_with("d/")
+        || s.starts_with("s/")
+        || s.starts_with("ViewPlugin")
+}
+
+/// The node's own label, choosing Description over Name when Description is
+/// non-empty and distinct (Tizen Dali quirk: some widgets put internal IDs
+/// in Name and the user-visible string in Description).
+fn direct_label(node: &Node) -> &str {
     if !node.description.is_empty() && node.description != node.name {
         node.description.as_str()
     } else {
         node.name.as_str()
     }
+}
+
+/// DFS descendants for the first non-empty, non-widget-id label. Used to
+/// hoist meaningful text up to wrappers whose own Name is just a plugin path.
+fn descendant_label(node: &Node) -> Option<String> {
+    for child in &node.children {
+        let l = direct_label(child);
+        if !l.is_empty() && !is_widget_id(l) {
+            return Some(l.to_string());
+        }
+        if let Some(s) = descendant_label(child) {
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// Pick the most human-readable label for this node. If our own label is
+/// empty or looks like a Dali widget id, walk descendants for the first real
+/// text we can find — that way a clickable tile wrapper surfaces "옴니버스
+/// 특별판 쫑알쫑알 똘똘이" instead of "ViewPluginWrapper_d/…@TerraTile_…".
+fn label_of(node: &Node) -> String {
+    let direct = direct_label(node);
+    if !direct.is_empty() && !is_widget_id(direct) {
+        return direct.to_string();
+    }
+    if let Some(s) = descendant_label(node) {
+        return s;
+    }
+    direct.to_string()
 }
 
 fn render(
@@ -451,7 +503,7 @@ fn render(
     let next_indent = if surface {
         let ref_idx = refmap.len() + 1;
         let ref_id = format!("e{}", ref_idx);
-        let label = label_of(node).to_string();
+        let label = label_of(node);
         refmap.push(RefEntry {
             sender: node.sender.clone(),
             path: node.path.clone(),
@@ -504,4 +556,87 @@ fn render(
             focus,
         );
     }
+}
+
+/// Phase 2: sequential render with monotonic `eN` ref assignment. Returns
+/// (rendered string, ref-bearing count, refmap).
+pub fn render_tree(
+    root: &Node,
+    interactive_only: bool,
+    verbose: bool,
+    focus: Option<(String, String)>,
+) -> (String, u32, Vec<RefEntry>) {
+    let mut refmap: Vec<RefEntry> = Vec::new();
+    let mut out = String::new();
+    let mut total: u32 = 0;
+    render(
+        root,
+        0,
+        &mut refmap,
+        &mut out,
+        &mut total,
+        interactive_only,
+        verbose,
+        focus.as_ref(),
+    );
+    (out, total, refmap)
+}
+
+/// Dump the raw `Node` tree — every fetched property, including nodes we
+/// later filter out in render. Cross-check this against the rendered output
+/// to see what got dropped on the floor.
+pub fn dump_raw(root: &Node) -> String {
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('\n', "\\n").replace('"', "\\\"")
+    }
+    fn tier_char(role: &str) -> char {
+        match role_tier(role) {
+            Tier::Interactive => 'I',
+            Tier::Content => 'C',
+            Tier::Structural => 'S',
+            Tier::Unknown => '?',
+        }
+    }
+    fn fmt_extents(e: &Option<(i32, i32, i32, i32)>) -> String {
+        match e {
+            Some((x, y, w, h)) => format!("({},{} {}x{})", x, y, w, h),
+            None => "?".to_string(),
+        }
+    }
+    fn fmt_attrs(attrs: &[(String, String)]) -> String {
+        if attrs.is_empty() {
+            return "{}".to_string();
+        }
+        let parts: Vec<String> = attrs
+            .iter()
+            .map(|(k, v)| format!("{}={:?}", k, v))
+            .collect();
+        format!("{{{}}}", parts.join(", "))
+    }
+    fn walk(node: &Node, indent: usize, out: &mut String) {
+        let pad = " ".repeat(indent * 2);
+        let bears = if ref_bearing(node) { '*' } else { ' ' };
+        out.push_str(&format!(
+            "{}[{}{}] role=\"{}\" name=\"{}\" desc=\"{}\" state=[{}] showing={} extents={} attrs={} children={} addr={}|{}\n",
+            pad,
+            tier_char(&node.role),
+            bears,
+            esc(&node.role),
+            esc(&node.name),
+            esc(&node.description),
+            node.state.short_flags(),
+            node.state.showing(),
+            fmt_extents(&node.extents),
+            fmt_attrs(&node.attributes),
+            node.children.len(),
+            node.sender,
+            node.path,
+        ));
+        for child in &node.children {
+            walk(child, indent + 1, out);
+        }
+    }
+    let mut out = String::new();
+    walk(root, 0, &mut out);
+    out
 }
