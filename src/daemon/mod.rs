@@ -33,10 +33,56 @@ pub fn socket_path() -> PathBuf {
     PathBuf::from(format!("{}/tvpilot.sock", runtime))
 }
 
+enum BindOutcome {
+    AnotherDaemonAlive,
+    Io(std::io::Error),
+}
+
+/// Bind the daemon socket safely:
+///   1. Try `bind` directly. On clean success, done.
+///   2. On `AddrInUse`: probe by `connect`. If the existing socket accepts,
+///      another daemon is already serving — return AnotherDaemonAlive.
+///      If the connect fails, the file is stale — unlink and retry bind once.
+///
+/// This is the "loser of the bind race exits without side effects" pattern
+/// from PLAN.md's Lifecycle table. Replaces the earlier remove-then-bind
+/// path that quietly leaked the original daemon every time someone (us
+/// during testing) `rm`'d the socket file out from under a live process.
+async fn bind_socket(sock: &PathBuf) -> Result<UnixListener, BindOutcome> {
+    match UnixListener::bind(sock) {
+        Ok(l) => return Ok(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Probe before clobbering.
+            match UnixStream::connect(sock).await {
+                Ok(_) => return Err(BindOutcome::AnotherDaemonAlive),
+                Err(_) => {
+                    // Stale socket file — safe to remove and retry.
+                    eprintln!(
+                        "[tvpilotd] stale socket at {}, reclaiming",
+                        sock.display()
+                    );
+                    let _ = std::fs::remove_file(sock);
+                }
+            }
+        }
+        Err(e) => return Err(BindOutcome::Io(e)),
+    }
+    UnixListener::bind(sock).map_err(BindOutcome::Io)
+}
+
 pub async fn run() -> Result<()> {
     let sock = socket_path();
-    let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
+    let listener = match bind_socket(&sock).await {
+        Ok(l) => l,
+        Err(BindOutcome::AnotherDaemonAlive) => {
+            eprintln!(
+                "[tvpilotd] another daemon is already alive on {} — exiting without side effects",
+                sock.display()
+            );
+            return Ok(());
+        }
+        Err(BindOutcome::Io(e)) => return Err(e).context(format!("bind {}", sock.display())),
+    };
     eprintln!("[tvpilotd] listening on {}", sock.display());
 
     // Toggle a11y on at startup. Best-effort.
