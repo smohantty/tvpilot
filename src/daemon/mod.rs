@@ -109,6 +109,15 @@ pub async fn run() -> Result<()> {
         }
     };
 
+    // Tell the AT-SPI Registry which events we care about. Without this,
+    // apps don't bother populating their tree even with IsEnabled=true —
+    // they only register when at least one AT has subscribed.
+    if let Err(e) = atspi::register_with_registry(&atspi_conn).await {
+        eprintln!("[tvpilotd] WARN Registry RegisterEvent: {:#}", e);
+    } else {
+        eprintln!("[tvpilotd] registered as AT-SPI event listener");
+    }
+
     let last_focus: FocusPointer = Arc::new(Mutex::new(None));
     if let Err(e) = atspi::install_focus_listener(&atspi_conn, last_focus.clone()).await {
         eprintln!("[tvpilotd] WARN focus listener: {:#}", e);

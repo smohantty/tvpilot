@@ -160,6 +160,66 @@ pub async fn connect_atspi() -> Result<Arc<SyncConnection>> {
     Ok(conn)
 }
 
+/// Tell the AT-SPI Registry which events we care about. This is the missing
+/// piece without aurum-bootstrap: AT-SPI's design is "apps only populate
+/// their accessible tree once at least one assistive technology has
+/// subscribed to events." Just toggling `IsEnabled=true` on the session bus
+/// is not enough — apps need to see a subscribed listener.
+///
+/// libatspi does this in `atspi_event_listener_register()`, which internally
+/// calls `Registry.RegisterEvent("Window:Create:")` etc. We do the same set
+/// aurum registers in `AtspiAccessibleWatcher::eventThreadLoop` (libaurum's
+/// `AtspiAccessibleWatcher.cc:116-137`).
+pub async fn register_with_registry(conn: &Arc<SyncConnection>) -> Result<()> {
+    let registry = Proxy::new(
+        "org.a11y.atspi.Registry",
+        "/org/a11y/atspi/registry",
+        TIMEOUT,
+        conn.clone(),
+    );
+    let events = [
+        "Window:Create:",
+        "Window:Destroy:",
+        "Window:Activate:",
+        "Window:Deactivate:",
+        "Window:Restore:",
+        "Window:Raise:",
+        "Window:Lower:",
+        "Window:Minimize:",
+        "Window:Maximize:",
+        "Window:Resize:",
+        "Window:Move:",
+        "Window:PostRender:",
+        "Object:StateChanged:Focused",
+        "Object:StateChanged:Highlighted",
+        "Object:StateChanged:Visible",
+        "Object:StateChanged:Showing",
+        "Object:StateChanged:Selected",
+        "Object:StateChanged:Checked",
+        "Object:StateChanged:Pressed",
+        "Object:StateChanged:Defunct",
+        "Object:StateChanged:Active",
+        "Object:TextChanged:Insert",
+        "Object:TextChanged:Delete",
+        "Object:ChildrenChanged:Add",
+        "Object:ChildrenChanged:Remove",
+        "Object:ActiveDescendantChanged",
+    ];
+    for ev in events.iter() {
+        if let Err(e) = registry
+            .method_call::<(), _, _, _>(
+                "org.a11y.atspi.Registry",
+                "RegisterEvent",
+                (*ev,),
+            )
+            .await
+        {
+            eprintln!("[tvpilotd] WARN RegisterEvent({}): {}", ev, e);
+        }
+    }
+    Ok(())
+}
+
 /// Subscribe to `org.a11y.atspi.Event.Object` StateChanged signals on the
 /// AT-SPI bus and keep `last_focus` pointing at whichever element most
 /// recently set its `focused` or `highlighted` state to true. This lets the
@@ -482,6 +542,14 @@ fn build_tree(
         let state = StateBits::from_vec(state.map(|(v,)| v).unwrap_or_default());
         let children_pairs = children.map(|(v,)| v).unwrap_or_default();
 
+        // Visibility prune at fetch time: skip walking !SHOWING subtrees.
+        // This is the perf foundation of the walk on this firmware. Without
+        // aurum-bootstrap running, apps register on the bus but expose huge
+        // non-SHOWING tree skeletons; trying to walk them all times out.
+        // aurum-bootstrap apparently does extra handshakes (cache mask on
+        // the desktop, or similar) that cause apps to populate SHOWING
+        // correctly; until we replicate those, this prune is what keeps the
+        // walk bounded.
         if !state.showing() {
             return Node {
                 sender,
