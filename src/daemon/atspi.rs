@@ -412,174 +412,253 @@ pub fn build_tree(
     .boxed()
 }
 
-/// Decide whether a node gets a ref. Per PLAN.md "Role classification":
-///   - Interactive role → always
-///   - Content role → iff name non-empty
-///   - Structural role → never (children float up at the same indent)
-///   - Unknown role (Tizen Dali widgets, etc.) → state-based promotion:
-///     ref if the node is interactive (sensitive/focusable/highlightable)
-///     or has a non-empty name (so labels still surface)
-fn ref_bearing(node: &Node) -> bool {
-    if !node.state.showing() {
-        return false;
+// ─── Transform phase ────────────────────────────────────────────────────────
+//
+// Pipeline is three explicit phases:
+//   1. `build_tree`  — raw AT-SPI walk, no opinions. Source of truth, dumped
+//      verbatim to `tvpilot-raw.txt` for inspection.
+//   2. `transform_tree` — cleanup + filter + ref assignment. Consumes the
+//      raw `Node` tree, produces an `AgentNode` tree shaped for an LLM:
+//      pure pass-through wrappers collapsed, refs assigned in tree order,
+//      class promoted from `attributes["class"]` to the displayed type.
+//   3. `render_tree` — dumb stringification of the AgentNode tree.
+//
+// Toolkit-agnostic by construction: keep/drop is decided from AT-SPI state
+// bits, role, and attribute presence — not widget naming conventions. The
+// only Tizen-specific bit is the small `JUNK_TEXT` list below, isolated so
+// it's easy to read, delete, or swap on platform change.
+
+/// Strings the Samsung/Tizen Dali toolkit puts in `name`/`description` that
+/// are framework noise, not user-facing content. Seeded from aurum-cli's
+/// `IsStructuralContent` (`aurum_client.cpp:509`) and `IsFrameworkText`.
+const JUNK_TEXT: &[&str] = &[
+    "AppContent_ImageTile",
+    "CommonUIPlate",
+    "ImageTileBasic",
+    "MainInfo",
+    "InnerStroke",
+    "Divider",
+    "AdditionalInfo2",
+    "SubText1",
+    "image",
+    "clipRoot",
+];
+
+fn is_junk(s: &str) -> bool {
+    if JUNK_TEXT.iter().any(|j| s == *j) {
+        return true;
     }
-    let has_label = !node.name.is_empty() || !node.description.is_empty();
-    match role_tier(&node.role) {
-        Tier::Interactive => true,
-        Tier::Content => has_label,
-        Tier::Structural => false,
-        Tier::Unknown => node.state.is_interactive() || has_label,
+    // Short id-like strings (Tizen `Layout_1-1-3` cores) — purely digits/dashes
+    // up to 7 chars, with at least one dash.
+    if s.len() <= 7
+        && s.contains('-')
+        && s.chars().all(|c| c.is_ascii_digit() || c == '-')
+    {
+        return true;
     }
+    false
 }
 
-/// Heuristic for "this label is a Tizen Dali widget identifier rather than
-/// something a human or LLM would want to read." We use this to decide
-/// whether to hoist a descendant's text label up to a wrapper.
-fn is_widget_id(s: &str) -> bool {
-    s.contains('@')
-        || s.starts_with("d/")
-        || s.starts_with("s/")
-        || s.starts_with("ViewPlugin")
-}
-
-/// The node's own label, choosing Description over Name when Description is
-/// non-empty and distinct (Tizen Dali quirk: some widgets put internal IDs
-/// in Name and the user-visible string in Description).
-fn direct_label(node: &Node) -> &str {
-    if !node.description.is_empty() && node.description != node.name {
-        node.description.as_str()
-    } else {
-        node.name.as_str()
-    }
-}
-
-/// DFS descendants for the first non-empty, non-widget-id label. Used to
-/// hoist meaningful text up to wrappers whose own Name is just a plugin path.
-fn descendant_label(node: &Node) -> Option<String> {
-    for child in &node.children {
-        let l = direct_label(child);
-        if !l.is_empty() && !is_widget_id(l) {
-            return Some(l.to_string());
+/// User-visible content for this node, picking from the AT-SPI fields most
+/// likely to carry it on this firmware:
+///   1. `attributes["automationId"]` — Tizen's preferred way to label tiles
+///      (content rows, app launcher items, settings sections)
+///   2. `Description` — when distinct from `Name`
+///   3. `Name` — but only when the role is in the Content tier (label,
+///      heading, image, text) or Interactive tier (button, list item, …),
+///      because those roles semantically use `Name` as the user-facing
+///      string. For Structural/Unknown roles, `Name` is the widget class
+///      and we deliberately return empty so the filter can drop the node.
+fn display_label(node: &Node) -> String {
+    if let Some((_, v)) = node.attributes.iter().find(|(k, _)| k == "automationId") {
+        if !v.is_empty() && !is_junk(v) {
+            return v.clone();
         }
-        if let Some(s) = descendant_label(child) {
-            return Some(s);
+    }
+    if !node.description.is_empty()
+        && node.description != node.name
+        && !is_junk(&node.description)
+    {
+        return node.description.clone();
+    }
+    if !node.name.is_empty() && !is_junk(&node.name) {
+        match role_tier(&node.role) {
+            Tier::Content | Tier::Interactive => return node.name.clone(),
+            _ => {}
         }
     }
-    None
+    String::new()
 }
 
-/// Pick the most human-readable label for this node. If our own label is
-/// empty or looks like a Dali widget id, walk descendants for the first real
-/// text we can find — that way a clickable tile wrapper surfaces "옴니버스
-/// 특별판 쫑알쫑알 똘똘이" instead of "ViewPluginWrapper_d/…@TerraTile_…".
-fn label_of(node: &Node) -> String {
-    let direct = direct_label(node);
-    if !direct.is_empty() && !is_widget_id(direct) {
-        return direct.to_string();
+/// Displayed widget type. Prefer the Dali class from `attributes["class"]`
+/// (gives `"Control"`, `"Layer"`, `"TextLabel"`, `"ScrollView"` — the real
+/// widget shape) and fall back to AT-SPI's `role` name. On Tizen, AT-SPI
+/// `role` is `"unknown"` for nearly every Dali widget; the class attr is
+/// where the truth lives.
+fn display_type(node: &Node) -> String {
+    if let Some((_, v)) = node.attributes.iter().find(|(k, _)| k == "class") {
+        if !v.is_empty() {
+            return v.clone();
+        }
     }
-    if let Some(s) = descendant_label(node) {
-        return s;
-    }
-    direct.to_string()
+    node.role.clone()
 }
 
-fn render(
-    node: &Node,
-    indent: usize,
-    refmap: &mut Vec<RefEntry>,
-    out: &mut String,
-    total: &mut u32,
-    interactive_only: bool,
-    verbose: bool,
+fn has_user_text(node: &Node) -> bool {
+    !display_label(node).is_empty()
+}
+
+/// Agent-facing tree. Built by `transform_tree` from the raw `Node` tree
+/// with refs already assigned in tree-traversal order. Rendering is just
+/// stringification of this.
+pub struct AgentNode {
+    pub ref_id: String,
+    pub typ: String,
+    pub label: String,
+    pub extents: Option<(i32, i32, i32, i32)>,
+    pub focused: bool,
+    pub state_flags: String,
+    pub children: Vec<AgentNode>,
+    // Bookkeeping so the action surface can map a ref back to an AT-SPI
+    // object reference (sender bus-name + object path). Not consumed yet —
+    // refmap is the live readout for now.
+    #[allow(dead_code)]
+    pub sender: String,
+    #[allow(dead_code)]
+    pub path: String,
+}
+
+/// Phase 2 entrypoint. Two passes:
+///   1. `build_agent_tree` — bottom-up filter, produces an `AgentNode` tree
+///      with empty `ref_id`s. Pure-passthrough wrappers are collapsed,
+///      kept grandchildren promoted.
+///   2. `assign_refs` — top-down pre-order DFS, fills in `ref_id` and
+///      builds the refmap so e1 is the root, e2 its first child, …
+///      (matches how a human reads the rendered output).
+pub fn transform_tree(
+    node: Node,
     focus: Option<&(String, String)>,
-) {
+    interactive_only: bool,
+) -> (Vec<AgentNode>, Vec<RefEntry>) {
+    let mut roots = build_agent_tree(node, focus, interactive_only);
+    let mut next_ref: u32 = 0;
+    let mut refmap: Vec<RefEntry> = Vec::new();
+    for root in &mut roots {
+        assign_refs(root, &mut next_ref, &mut refmap);
+    }
+    (roots, refmap)
+}
+
+/// Bottom-up filter. A node survives if:
+///   - it has user-visible text (`display_label` non-empty), OR
+///   - it's interactive (focusable/sensitive/highlightable, and showing), OR
+///   - it groups ≥2 kept children (a real container, not a decorative chain).
+///
+/// `interactive_only` tightens the rule: text-only nodes drop unless they're
+/// also containers, so the agent gets just the touchable set.
+fn build_agent_tree(
+    mut node: Node,
+    focus: Option<&(String, String)>,
+    interactive_only: bool,
+) -> Vec<AgentNode> {
+    let children = std::mem::take(&mut node.children);
+    let kept_children: Vec<AgentNode> = children
+        .into_iter()
+        .flat_map(|c| build_agent_tree(c, focus, interactive_only))
+        .collect();
+
     if !node.state.showing() {
-        return;
+        return kept_children;
     }
 
-    let bears = ref_bearing(node);
-    let surface = bears && (!interactive_only || node.state.is_interactive());
-
-    let next_indent = if surface {
-        let ref_idx = refmap.len() + 1;
-        let ref_id = format!("e{}", ref_idx);
-        let label = label_of(node);
-        refmap.push(RefEntry {
-            sender: node.sender.clone(),
-            path: node.path.clone(),
-            role: node.role.clone(),
-            name: label.clone(),
-        });
-
-        let pad = " ".repeat(indent * 2);
-        // Mark focused on either the live state bits (works on standard
-        // a11y) or the event-tracked focus pointer (works on Tizen Dali,
-        // where state bits stay 0 but events fire).
-        let focused_by_state = node.state.focused() || node.state.highlighted();
-        let focused_by_event = focus
-            .map(|(s, p)| s == &node.sender && p == &node.path)
-            .unwrap_or(false);
-        let focused_now = focused_by_state || focused_by_event;
-        let marker = if focused_now { "*" } else { "" };
-        let label_part = if label.is_empty() {
-            String::new()
-        } else {
-            format!(" \"{}\"{}", label, marker)
-        };
-        if verbose {
-            let flags_part = format!(" [{}]", node.state.short_flags());
-            out.push_str(&format!(
-                "{}- {}{}{} [ref={}]\n",
-                pad, node.role, label_part, flags_part, ref_id
-            ));
-        } else if label.is_empty() {
-            // No label at all: surface the role so the line says something.
-            out.push_str(&format!("{}- {}{} [ref={}]\n", pad, node.role, marker, ref_id));
-        } else {
-            out.push_str(&format!("{}-{} [ref={}]\n", pad, label_part, ref_id));
-        }
-        *total += 1;
-        indent + 1
+    let interactive = node.state.is_interactive();
+    let text = has_user_text(&node);
+    let groups = kept_children.len() >= 2;
+    let keep = if interactive_only {
+        interactive || groups
     } else {
-        indent
+        interactive || text || groups
     };
 
-    for child in &node.children {
-        render(
-            child,
-            next_indent,
-            refmap,
-            out,
-            total,
-            interactive_only,
-            verbose,
-            focus,
-        );
+    if !keep {
+        return kept_children;
+    }
+
+    let label = display_label(&node);
+    let typ = display_type(&node);
+    let focused = node.state.focused()
+        || node.state.highlighted()
+        || focus
+            .map(|(s, p)| s == &node.sender && p == &node.path)
+            .unwrap_or(false);
+
+    vec![AgentNode {
+        ref_id: String::new(),
+        typ,
+        label,
+        extents: node.extents,
+        focused,
+        state_flags: node.state.short_flags(),
+        children: kept_children,
+        sender: node.sender,
+        path: node.path,
+    }]
+}
+
+/// Pre-order DFS to assign monotonic refs (root = e1) and populate refmap.
+fn assign_refs(node: &mut AgentNode, next_ref: &mut u32, refmap: &mut Vec<RefEntry>) {
+    *next_ref += 1;
+    node.ref_id = format!("e{}", *next_ref);
+    refmap.push(RefEntry {
+        sender: node.sender.clone(),
+        path: node.path.clone(),
+        role: node.typ.clone(),
+        name: node.label.clone(),
+    });
+    for child in &mut node.children {
+        assign_refs(child, next_ref, refmap);
     }
 }
 
-/// Phase 2: sequential render with monotonic `eN` ref assignment. Returns
-/// (rendered string, ref-bearing count, refmap).
-pub fn render_tree(
-    root: &Node,
-    interactive_only: bool,
-    verbose: bool,
-    focus: Option<(String, String)>,
-) -> (String, u32, Vec<RefEntry>) {
-    let mut refmap: Vec<RefEntry> = Vec::new();
+/// Phase 3: stringify the agent tree. Output shape:
+///   - `[Type] "label"* @(x,y wxh) {flags} [ref=eN]`
+///   - `marker` is `*` when focused, empty otherwise
+///   - `label` is omitted if empty; `@(...)` if extents degenerate;
+///     `{flags}` only in verbose mode.
+pub fn render_tree(roots: &[AgentNode], verbose: bool) -> (String, u32) {
     let mut out = String::new();
     let mut total: u32 = 0;
-    render(
-        root,
-        0,
-        &mut refmap,
-        &mut out,
-        &mut total,
-        interactive_only,
-        verbose,
-        focus.as_ref(),
-    );
-    (out, total, refmap)
+    for root in roots {
+        render_node(root, 0, &mut out, &mut total, verbose);
+    }
+    (out, total)
+}
+
+fn render_node(node: &AgentNode, indent: usize, out: &mut String, total: &mut u32, verbose: bool) {
+    let pad = " ".repeat(indent * 2);
+    let label_part = if node.label.is_empty() {
+        String::new()
+    } else {
+        format!(" \"{}\"", node.label)
+    };
+    let marker = if node.focused { "*" } else { "" };
+    let bbox_part = match node.extents {
+        Some((x, y, w, h)) if w != 0 || h != 0 => format!(" @({},{} {}x{})", x, y, w, h),
+        _ => String::new(),
+    };
+    let flags_part = if verbose {
+        format!(" {{{}}}", node.state_flags)
+    } else {
+        String::new()
+    };
+    out.push_str(&format!(
+        "{}- [{}]{}{}{}{} [ref={}]\n",
+        pad, node.typ, label_part, marker, bbox_part, flags_part, node.ref_id,
+    ));
+    *total += 1;
+    for child in &node.children {
+        render_node(child, indent + 1, out, total, verbose);
+    }
 }
 
 /// Dump the raw `Node` tree — every fetched property, including nodes we
@@ -613,9 +692,19 @@ pub fn dump_raw(root: &Node) -> String {
             .collect();
         format!("{{{}}}", parts.join(", "))
     }
+    // Leaf-level "would transform keep this on its own merit?" marker — for
+    // inspection only. The `>=2 kept children` rule is recursive so we don't
+    // try to encode it here; comparing raw vs rendered shows the full truth.
+    fn keep_marker(node: &Node) -> char {
+        if node.state.showing() && (has_user_text(node) || node.state.is_interactive()) {
+            '*'
+        } else {
+            ' '
+        }
+    }
     fn walk(node: &Node, indent: usize, out: &mut String) {
         let pad = " ".repeat(indent * 2);
-        let bears = if ref_bearing(node) { '*' } else { ' ' };
+        let bears = keep_marker(node);
         out.push_str(&format!(
             "{}[{}{}] role=\"{}\" name=\"{}\" desc=\"{}\" state=[{}] showing={} extents={} attrs={} children={} addr={}|{}\n",
             pad,

@@ -202,8 +202,12 @@ async fn do_snap(
     let mut chosen_bus = String::new();
     let mut chosen_nodes = 0u32;
     let mut combined_refmap: Vec<RefEntry> = Vec::new();
-    for ((sender, _), tree) in targets.iter().zip(trees.iter()) {
-        let (r, c, rm) = atspi::render_tree(tree, interactive, verbose, focus_snapshot.clone());
+    // Consume trees here (transform takes Node by value). dump_raw already
+    // ran against the borrow above, so the raw artifact is preserved.
+    for ((sender, _), tree) in targets.iter().zip(trees.into_iter()) {
+        let (agents, rm) =
+            atspi::transform_tree(tree, focus_snapshot.as_ref(), interactive);
+        let (r, c) = atspi::render_tree(&agents, verbose);
         node_count += c;
         if c == 0 {
             continue;
