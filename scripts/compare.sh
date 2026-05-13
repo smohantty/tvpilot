@@ -37,19 +37,28 @@ as_owner() {
     shell "su - owner -c \"export XDG_RUNTIME_DIR=$XDG; $cmd\""
 }
 
-bootstrap_running() {
-    shell 'pgrep -f /usr/apps/org.tizen.aurum-bootstrap/bin/aurum-bootstrap >/dev/null'
+# Bootstrap is healthy when its process exists AND isn't in D-state. A
+# D-state aurum-bootstrap looks alive to pgrep but its gRPC server is
+# wedged; aurum-cli will hang for ~33 s on connect. Refuse to proceed in
+# that case — only a TV reboot clears it.
+bootstrap_healthy() {
+    local pid state
+    pid=$(shell "pgrep -f /usr/apps/org.tizen.aurum-bootstrap/bin/aurum-bootstrap" 2>/dev/null | head -1 | tr -d '\r' || true)
+    [ -z "$pid" ] && return 1
+    state=$(shell "awk '/^State:/ {print \$2; exit}' /proc/$pid/status 2>/dev/null" | tr -d '\r')
+    [ "$state" != "D" ]
 }
 
 echo "==> Target: $TARGET"
 
-# 1. Aurum-bootstrap must already be running (run scripts/setup.sh first).
-if ! bootstrap_running; then
-    echo "ERROR: aurum-bootstrap is not running on $TARGET" >&2
-    echo "       run scripts/setup.sh first (once per boot)" >&2
+# 1. Aurum-bootstrap must already be running AND responsive.
+if ! bootstrap_healthy; then
+    echo "ERROR: aurum-bootstrap is not running healthy on $TARGET" >&2
+    echo "       run scripts/setup.sh first (once per boot); if that" >&2
+    echo "       reports a D-state process, the TV needs a reboot." >&2
     exit 1
 fi
-echo "==> aurum-bootstrap up — proceeding"
+echo "==> aurum-bootstrap healthy — proceeding"
 
 # 2a. Time aurum-cli dump-tree.
 echo "==> Timing tizen-aurum-cli dump-tree ($RUNS runs)"
