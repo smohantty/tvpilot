@@ -232,9 +232,17 @@ async fn do_click(
     }
     eprintln!("[tvpilotd] click path: {}", path_used);
 
-    // Give the UI a beat to settle. PLAN.md calls for waiting on
-    // window:post-render; we'll get there once we wire up event subscription.
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // Wait for AT-SPI to have a stable active app again. Replaces the old
+    // fixed 150 ms sleep — covers both same-app actions (short wait) and
+    // cross-app transitions where the old app drops STATE_ACTIVE but the
+    // new app hasn't registered yet.
+    let t = std::time::Instant::now();
+    let stable = atspi::wait_for_active_app(&state.atspi, std::time::Duration::from_millis(1500)).await;
+    eprintln!(
+        "[tvpilotd] post-action stabilise: {} after {:?}",
+        if stable { "active" } else { "timeout" },
+        t.elapsed()
+    );
 
     do_snap(state, interactive, verbose, timing).await
 }

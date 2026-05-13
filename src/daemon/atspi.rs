@@ -261,6 +261,32 @@ pub async fn list_apps(conn: &Arc<SyncConnection>) -> Result<Vec<(String, String
         .collect())
 }
 
+/// Wait until at least one app on the AT-SPI bus has STATE_ACTIVE set. Polls
+/// every ~75 ms until either an active app appears or `timeout` elapses.
+///
+/// Used after click/action commands to ride out the cross-app transition
+/// window during which the old app drops STATE_ACTIVE but the new app hasn't
+/// registered yet. Returns true if a stable active app was observed.
+pub async fn wait_for_active_app(
+    conn: &Arc<SyncConnection>,
+    timeout: Duration,
+) -> bool {
+    // Tiny up-front sleep so simple same-app actions (where the active app
+    // never goes away) don't poll instantly and return a half-rendered tree.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let apps = list_apps(conn).await.unwrap_or_default();
+        if find_active_app(conn, &apps).await.is_some() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(75)).await;
+    }
+}
+
 /// Probe every app's root state in parallel and return the one with
 /// `STATE_ACTIVE` set. Confirmed on Tizen 10: only the foreground app sets it.
 pub async fn find_active_app(
